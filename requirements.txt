@@ -1,0 +1,16 @@
+# YOLO (Ultralytics)
+ultralytics>=8.0.0
+
+# Datos y ciencia de datos
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+
+# tkinter: viene con Python estándar.
+# En Linux (Debian/Ubuntu) si falta: sudo apt install python3-tk
+
+# Face tracking / identificación (face_tracking.py) — ArcFace vía InsightFace
+insightface>=0.7.0
+onnxruntime>=1.14.0
