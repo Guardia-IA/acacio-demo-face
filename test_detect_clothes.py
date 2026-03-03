@@ -4,11 +4,15 @@ Prueba de detección de ropa y complementos en vídeo.
 - Detecta personas con YOLO.
 - Para cada persona: complementos (mochila, bolso, paraguas, corbata, maleta),
   color de la parte superior e inferior.
-- El tipo concreto de prenda (camiseta/abrigo, pantalón/falda) requeriría
-  un modelo de moda; aquí se reporta solo la zona y el color.
+- Usa tracking (BoT-SORT/ByteTrack) para IDs consistentes.
+- Si hay usuarios registrados en face_tracking (ArcFace), intenta identificarlos
+  comparando la cara frontal con sus embeddings y muestra nombre/ID en el panel.
 """
 
 import argparse
+import json
+import warnings
+import pickle
 import sys
 import threading
 from pathlib import Path
@@ -28,34 +32,132 @@ try:
 except Exception:
     pass
 
-# Cascade para detección de cara frontal (OpenCV). Carga perezosa.
-_face_cascade = None
+PATH_VIDEOS = "/home/debian/sharedVM/sergi_reconocimiento_facial/finales"
 
-def _get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        _face_cascade = cv2.CascadeClassifier(path)
-    return _face_cascade
+# Suprimir FutureWarning de InsightFace (skimage: tform.estimate deprecado)
+warnings.filterwarnings("ignore", message=".*estimate.*deprecated.*", category=FutureWarning)
+
+# ----------------------
+# Identificación (ArcFace / InsightFace)
+# ----------------------
+_arcface_app = None
 
 
-def has_frontal_face(crop_bgr, min_size_ratio=0.2):
+def get_arcface_app():
     """
-    True si en el recorte (zona superior del cuerpo/cara) se detecta al menos una cara frontal.
-    crop_bgr: recorte BGR (p. ej. parte superior de la bbox de la persona).
+    Carga InsightFace FaceAnalysis (ArcFace) una vez para todo el script.
+    Usa el mismo modelo que face_tracking.py (buffalo_l).
     """
-    if crop_bgr is None or crop_bgr.size == 0:
-        return False
-    cascade = _get_face_cascade()
-    if cascade.empty():
-        return False
-    gris = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    h, w = gris.shape[:2]
-    min_side = int(min(w, h) * min_size_ratio)
-    min_side = max(20, min_side)
-    caras = cascade.detectMultiScale(gris, scaleFactor=1.1, minNeighbors=4, minSize=(min_side, min_side))
-    return len(caras) > 0
+    global _arcface_app
+    if _arcface_app is None:
+        try:
+            from insightface.app import FaceAnalysis
+        except ImportError:
+            return None
+        root_dir = Path.home() / ".insightface"
+        app = FaceAnalysis(name="buffalo_l", root=str(root_dir))
+        # det_size mayor para detectar caras pequeñas (persona lejos en 4K)
+        app.prepare(ctx_id=-1, det_thresh=0.4, det_size=(640, 640))
+        _arcface_app = app
+    return _arcface_app
 
+
+def load_registered_users():
+    """
+    Carga register_users.json generado por face_tracking.py.
+    Devuelve lista de dicts con id, nombre, pkl_path, encoding (media) y encodings (lista).
+    Usa encodings para comparación best-of-N (mejor que solo la media).
+    """
+    base_dir = Path(__file__).resolve().parent
+    reg_path = base_dir / "register_users.json"
+    if not reg_path.is_file():
+        return []
+    try:
+        with open(reg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    users = []
+    for u in data if isinstance(data, list) else []:
+        pkl_path = Path(u.get("pkl_path", ""))
+        if not pkl_path.is_file():
+            continue
+        try:
+            with open(pkl_path, "rb") as f:
+                contenido = pickle.load(f)
+            enc_mean = np.asarray(contenido.get("encoding"), dtype=np.float32)
+            if enc_mean.ndim != 1:
+                continue
+            nrm = np.linalg.norm(enc_mean)
+            if nrm > 1e-6:
+                enc_mean = enc_mean / nrm
+            encodings_list = contenido.get("encodings", [])
+            encodings_norm = []
+            for e in encodings_list:
+                e = np.asarray(e, dtype=np.float32)
+                if e.ndim != 1:
+                    continue
+                n = np.linalg.norm(e)
+                if n > 1e-6:
+                    e = e / n
+                encodings_norm.append(e)
+            if not encodings_norm:
+                encodings_norm = [enc_mean]
+            users.append(
+                {
+                    "id": int(u.get("id")),
+                    "nombre": contenido.get("nombre") or u.get("nombre", "desconocido"),
+                    "pkl_path": str(pkl_path),
+                    "encoding": enc_mean,
+                    "encodings": encodings_norm,
+                }
+            )
+        except Exception:
+            continue
+    return users
+
+
+def identificar_cara_arcface(crop_bgr, usuarios_db, app_arcface, sim_threshold=0.42, debug=False, frame_idx=None):
+    """
+    Obtiene embedding ArcFace de crop_bgr y lo compara con la base de usuarios.
+    Usa best-of-N: compara con todos los encodings guardados de cada usuario y toma el mejor score.
+    Devuelve (identidad, has_face, edad, genero): identidad dict o None; edad/genero desde InsightFace.
+    """
+    if crop_bgr is None or crop_bgr.size == 0 or app_arcface is None:
+        return None, False, None, None
+    img = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    faces = app_arcface.get(img)
+    if not faces:
+        return None, False, None, None
+    face = faces[0]
+    edad = int(face.age) if hasattr(face, "age") and face.age is not None else None
+    genero = "hombre" if (hasattr(face, "gender") and face.gender == 0) else ("mujer" if (hasattr(face, "gender") and face.gender == 1) else None)
+    if not hasattr(face, "embedding") or face.embedding is None:
+        return None, True, edad, genero
+    if not usuarios_db:
+        return None, True, edad, genero
+    emb = np.asarray(face.embedding, dtype=np.float32)
+    nrm = np.linalg.norm(emb)
+    if nrm > 1e-6:
+        emb = emb / nrm
+    best_score = -1.0
+    best_user = None
+    scores_per_user = []
+    for u in usuarios_db:
+        encodings = u.get("encodings", [u["encoding"]])
+        best_u = max(float(np.dot(vec, emb)) for vec in encodings)
+        scores_per_user.append((u, best_u))
+        if best_u > best_score:
+            best_score = best_u
+            best_user = u
+    if debug and usuarios_db:
+        frame_pref = f"Frame {frame_idx} | " if frame_idx is not None else ""
+        pkl_names = [Path(u["pkl_path"]).name for u in usuarios_db]
+        log_parts = [f"{u['nombre']} ({pk}): {s:.3f}" for (u, s), pk in zip(scores_per_user, pkl_names)]
+        print(f"  [debug-face] {frame_pref}similaridad vs .pkl → {', '.join(log_parts)} | umbral={sim_threshold} | {'MATCH' if best_user and best_score >= sim_threshold else 'no match'}")
+    if best_user is not None and best_score >= sim_threshold:
+        return {"id": best_user["id"], "nombre": best_user["nombre"], "score": best_score}, True, edad, genero
+    return None, True, edad, genero
 
 def get_upper_crop(frame, xyxy, h_frame, w_frame, ratio=0.45):
     """Recorte de la parte superior de la bbox (zona cara/hombros) para comprobar cara frontal."""
@@ -68,6 +170,25 @@ def get_upper_crop(frame, xyxy, h_frame, w_frame, ratio=0.45):
     if h_crop < 1:
         return None
     return frame[y1 : y1 + h_crop, x1:x2].copy()
+
+
+def get_face_crop_for_arcface(frame, xyxy, h_frame, w_frame, ratio=0.55, min_side=640):
+    """
+    Recorte de la zona cara desde el frame a máxima resolución.
+    Para personas lejanas (p. ej. 5 m en 4K) el crop es pequeño; hace zoom (upscale)
+    hasta min_side para que InsightFace detecte y ArcFace identifique correctamente.
+    frame: frame completo a resolución original (4K, 1080p, etc.).
+    """
+    crop = get_upper_crop(frame, xyxy, h_frame, w_frame, ratio=ratio)
+    if crop is None:
+        return None
+    h, w = crop.shape[:2]
+    if h < min_side or w < min_side:
+        scale = max(min_side / h, min_side / w)
+        nw = max(min_side, int(w * scale))
+        nh = max(min_side, int(h * scale))
+        crop = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    return crop
 
 
 # COCO pose keypoints: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee
@@ -145,8 +266,9 @@ def get_torso_regions_from_pose(crop_bgr, pose_model, conf_min=0.25):
     return zona_torso, zona_inf
 
 
-# Clases COCO: persona y complementos vestimentarios
+# Clases COCO: persona, perro y complementos vestimentarios
 COCO_PERSON = 0
+COCO_DOG = 16  # perro en COCO 80 clases
 COCO_ACCESSORY_IDS = {
     24: "mochila",
     25: "paraguas",
@@ -287,6 +409,27 @@ def nombre_color_a_hex(nombre):
     return COLOR_NAME_TO_RGB.get(nombre, "#505050")
 
 
+def deduplicar_personas(person_boxes, iou_umbral=0.5):
+    """
+    NMS: elimina detecciones duplicadas de la misma persona (IoU alto).
+    Mantiene la de mayor confianza cuando se solapan.
+    """
+    if len(person_boxes) <= 1:
+        return person_boxes
+    ordenadas = sorted(person_boxes, key=lambda x: -x[1])
+    keep = []
+    for cand in ordenadas:
+        xyxy_c, conf_c, tid_c = cand
+        solapado = False
+        for guardada in keep:
+            if iou_box(xyxy_c, guardada[0]) >= iou_umbral:
+                solapado = True
+                break
+        if not solapado:
+            keep.append(cand)
+    return keep
+
+
 def iou_box(box1, box2):
     """IoU entre dos cajas [x1, y1, x2, y2]."""
     x1 = max(box1[0], box2[0])
@@ -352,12 +495,15 @@ def procesar_frame(frame, model, imgsz=320):
 
     person_boxes = []
     accessory_boxes = []
+    dog_boxes = []
     for i in range(len(boxes)):
         cls_id = int(boxes.cls[i].item())
         xyxy = boxes.xyxy[i].cpu().numpy()
         conf = float(boxes.conf[i].item())
         if cls_id == COCO_PERSON:
             person_boxes.append((xyxy, conf))
+        elif cls_id == COCO_DOG:
+            dog_boxes.append((xyxy, conf))
         elif cls_id in COCO_ACCESSORY_IDS:
             accessory_boxes.append((xyxy, conf, cls_id))
 
@@ -406,23 +552,23 @@ def procesar_frame(frame, model, imgsz=320):
 def track_frame(frame, model, imgsz=320, tracker="botsort.yaml"):
     """
     Ejecuta YOLO con tracking. Por defecto BoT-SORT (mejor cuando la persona se gira/cambia de postura).
-    ByteTrack solo usa posición/movimiento y puede asignar otro ID al mismo al cambiar la apariencia.
-    Returns: (person_boxes_with_id, accessory_boxes, complementos_por_persona).
+    Returns: (person_boxes_with_id, accessory_boxes, complementos_por_persona, dog_boxes).
     """
     results = model.track(
         frame, imgsz=imgsz, persist=True, verbose=False,
         tracker=tracker,
     )
     if not results:
-        return [], [], []
+        return [], [], [], []
     r = results[0]
     boxes = r.boxes
     if boxes is None:
-        return [], [], []
+        return [], [], [], []
     ids = boxes.id  # puede ser None si no hay tracking
 
     person_boxes = []
     accessory_boxes = []
+    dog_boxes = []
     for i in range(len(boxes)):
         cls_id = int(boxes.cls[i].item())
         xyxy = boxes.xyxy[i].cpu().numpy()
@@ -430,15 +576,18 @@ def track_frame(frame, model, imgsz=320, tracker="botsort.yaml"):
         tid = int(ids[i].item()) if ids is not None and i < len(ids) else None
         if cls_id == COCO_PERSON:
             person_boxes.append((xyxy, conf, tid))
+        elif cls_id == COCO_DOG:
+            dog_boxes.append((xyxy, conf))
         elif cls_id in COCO_ACCESSORY_IDS:
             accessory_boxes.append((xyxy, conf, cls_id))
 
+    person_boxes = deduplicar_personas(person_boxes)
     person_boxes.sort(key=lambda x: (x[0][1] + x[0][3]) / 2)
     # Asociar complementos (por índice de persona)
     comp_por_persona = asociar_complementos_a_personas(
         [(b[0], b[1]) for b in person_boxes], accessory_boxes
     )
-    return person_boxes, accessory_boxes, comp_por_persona
+    return person_boxes, accessory_boxes, comp_por_persona, dog_boxes
 
 
 def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=None):
@@ -455,6 +604,7 @@ def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=Non
     if x2 <= x1 or y2 <= y1:
         return {
             "thumbnail": None,
+            "crop_persona": None,
             "color_superior": "no detectable",
             "color_inferior": "no detectable",
             "complementos": [],
@@ -463,6 +613,8 @@ def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=Non
         }
     crop = frame[y1:y2, x1:x2]
     h_crop, w_crop = crop.shape[:2]
+    # Crop de la persona (foto completa) para el panel
+    crop_persona = cv2.resize(crop, (160, 200), interpolation=cv2.INTER_AREA)
     # Thumbnail: parte superior (~35 %) para simular zona cara/cuerpo
     h_thumb = max(1, int(h_crop * 0.35))
     thumb = frame[y1 : y1 + h_thumb, x1:x2].copy()
@@ -505,6 +657,7 @@ def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=Non
 
     return {
         "thumbnail": thumb,
+        "crop_persona": crop_persona,
         "color_superior": color_sup["nombre"],
         "color_superior_hex": color_sup["hex"],
         "color_inferior": color_inf["nombre"],
@@ -532,30 +685,49 @@ def dibujar_cajas(frame, person_boxes, analisis):
             )
 
 
-def dibujar_cajas_track(frame, person_boxes_with_id):
-    """Dibuja cajas y track_id. person_boxes_with_id = [(xyxy, conf, track_id), ...]."""
+# Colores BGR para bounding boxes
+COLOR_PERSONA_NO_ID = (255, 0, 0)    # azul (por defecto)
+COLOR_PERSONA_ID = (0, 255, 0)       # verde (identificado)
+COLOR_PERRO = (255, 0, 255)          # morado
+
+def dibujar_cajas_track(frame, person_boxes_with_id, track_identity=None, dog_boxes=None):
+    """
+    Dibuja cajas: personas azul (por defecto) o verde (identificado), perros morado.
+    Si identificado: muestra nombre en vez de ID. Bbox y texto más grandes.
+    """
+    track_identity = track_identity or {}
+    dog_boxes = dog_boxes or []
+    thickness = 4
+    font_scale = 1.0
+    font_thickness = 2
+
     for (x1, y1, x2, y2), conf, tid in person_boxes_with_id:
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = str(tid) if tid is not None else "?"
+        ident = track_identity.get(tid) if tid is not None else None
+        if ident and ident.get("nombre"):
+            color = COLOR_PERSONA_ID
+            label = ident["nombre"]
+        else:
+            color = COLOR_PERSONA_NO_ID
+            label = str(tid) if tid is not None else "?"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        txt_pos = (x1, y1 - 8 if y1 > 30 else y1 + 28)
         cv2.putText(
-            frame, f"ID {label}",
-            (x1, y1 - 6 if y1 > 20 else y1 + 18),
+            frame, label,
+            txt_pos,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (0, 255, 0), 1, cv2.LINE_AA,
+            font_scale, color, font_thickness, cv2.LINE_AA,
         )
 
-
-def frame_bgr_a_photoimage(frame_bgr, max_ancho=960, max_alto=720):
-    """Convierte un frame BGR (OpenCV) a ImageTk.PhotoImage para Tkinter, redimensionando si hace falta."""
-    h, w = frame_bgr.shape[:2]
-    if w > max_ancho or h > max_alto:
-        escala = min(max_ancho / w, max_alto / h)
-        nw, nh = int(w * escala), int(h * escala)
-        frame_bgr = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(rgb)
-    return ImageTk.PhotoImage(image=img)
+    for (x1, y1, x2, y2), conf in dog_boxes:
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_PERRO, thickness)
+        cv2.putText(
+            frame, "Perro",
+            (x1, y1 - 8 if y1 > 30 else y1 + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale, COLOR_PERRO, font_thickness, cv2.LINE_AA,
+        )
 
 
 def frame_bgr_a_photoimage(frame_bgr, max_ancho=960, max_alto=720):
@@ -581,25 +753,68 @@ def thumbnail_a_photoimage(thumb_bgr, ancho=96, alto=112):
     return ImageTk.PhotoImage(image=Image.fromarray(rgb))
 
 
-def crear_tarjeta_persona(parent, track_id, info, photo_refs_list):
-    """
-    Crea una tarjeta en el panel lateral: thumbnail, ID, ropa sup/inf con color, complementos, Identificado: No.
-    photo_refs_list: lista donde guardar referencias a PhotoImage para que no se pierdan.
-    """
-    card = tk.Frame(parent, bg="#3d3d3d", padx=8, pady=8, relief="ridge", borderwidth=1)
-    card.pack(fill="x", padx=4, pady=4)
+def crop_a_photoimage(crop_bgr, ancho=160, alto=200):
+    """Convierte crop BGR a PhotoImage para el panel."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    h, w = crop_bgr.shape[:2]
+    if w != ancho or h != alto:
+        crop_bgr = cv2.resize(crop_bgr, (ancho, alto), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    return ImageTk.PhotoImage(image=Image.fromarray(rgb))
 
-    # Thumbnail (zona cara/arriba)
-    if info.get("thumbnail") is not None:
-        ph = thumbnail_a_photoimage(info["thumbnail"])
+
+def crop_cara_a_photoimage(crop_bgr, tam=120):
+    """Convierte crop de cara BGR a PhotoImage cuadrado para el panel."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    h, w = crop_bgr.shape[:2]
+    if w != tam or h != tam:
+        crop_bgr = cv2.resize(crop_bgr, (tam, tam), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    return ImageTk.PhotoImage(image=Image.fromarray(rgb))
+
+
+def _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list):
+    """Llena el contenido de una tarjeta (reutilizable para crear y actualizar)."""
+    # Crop de la cara (solo rostro)
+    crop_cara = info.get("crop_cara")
+    if crop_cara is not None:
+        ph = crop_cara_a_photoimage(crop_cara)
         if ph is not None:
             photo_refs_list.append(ph)
-            tk.Label(card, image=ph, bg="#3d3d3d").pack(pady=(0, 4))
+            tk.Label(card, image=ph, bg="#3d3d3d").pack(pady=(0, 6))
     else:
-        tk.Label(card, text="[Sin imagen]", bg="#3d3d3d", fg="#888").pack(pady=(0, 4))
+        crop_persona = info.get("crop_persona")
+        if crop_persona is None:
+            crop_persona = info.get("thumbnail")
+        if crop_persona is not None:
+            ph = crop_a_photoimage(crop_persona)
+            if ph is not None:
+                photo_refs_list.append(ph)
+                tk.Label(card, image=ph, bg="#3d3d3d").pack(pady=(0, 6))
+        else:
+            tk.Label(card, text="[Sin imagen]", bg="#3d3d3d", fg="#888").pack(pady=(0, 6))
 
-    # ID
-    tk.Label(card, text=f"ID: {track_id}", font=("Segoe UI", 11, "bold"), fg="white", bg="#3d3d3d").pack(anchor="w")
+    # ID: track_id o user_id si identificado
+    user_id = info.get("user_id")
+    user_name = info.get("user_nombre", "desconocido")
+    id_txt = f"ID: {user_id}" if user_id is not None else f"Track ID: {track_id}"
+    tk.Label(card, text=id_txt, font=("Segoe UI", 10, "bold"), fg="white", bg="#3d3d3d").pack(anchor="w")
+
+    # Nombre
+    tk.Label(card, text=f"Nombre: {user_name}", font=("Segoe UI", 10), fg="#ddd", bg="#3d3d3d").pack(anchor="w")
+
+    # Sexo y edad estimada
+    genero = info.get("genero")
+    edad = info.get("edad")
+    sexo_txt = str(genero) if genero is not None else "—"
+    edad_txt = str(edad) if edad is not None else "—"
+    tk.Label(card, text=f"Sexo: {sexo_txt} | Edad: {edad_txt}", font=("Segoe UI", 10), fg="#ccc", bg="#3d3d3d").pack(anchor="w")
+
+    # Similitud (0-100) si identificado — coseno entre embeddings
+    if info.get("identificado") and info.get("pct_acierto") is not None:
+        tk.Label(card, text=f"Similitud: {info['pct_acierto']}% (sobre 100)", font=("Segoe UI", 10), fg="#40c040", bg="#3d3d3d").pack(anchor="w", pady=(2, 0))
 
     # Ropa superior: [cuadro color] texto (nombre + hex)
     row_sup = tk.Frame(card, bg="#3d3d3d")
@@ -659,15 +874,43 @@ def crear_tarjeta_persona(parent, track_id, info, photo_refs_list):
     else:
         tk.Label(card, text="Complementos: ninguno", font=("Segoe UI", 9), fg="#888", bg="#3d3d3d").pack(anchor="w")
 
-    # Identificado: No
-    tk.Label(card, text="Identificado: No", font=("Segoe UI", 9), fg="#f0a030", bg="#3d3d3d").pack(anchor="w", pady=(4, 0))
-    return card
+    # Identificado: Sí/No
+    identificado = info.get("identificado", False)
+    if identificado:
+        txt_id = "Identificado: Sí"
+        color = "#40c040"
+    else:
+        txt_id = "Identificado: No"
+        color = "#f0a030"
+    tk.Label(card, text=txt_id, font=("Segoe UI", 9), fg=color, bg="#3d3d3d").pack(anchor="w", pady=(4, 0))
+
+
+def crear_tarjeta_persona(parent, track_id, info, photo_refs_list):
+    """
+    Crea una tarjeta independiente en el panel: crop, id, nombre, sexo, edad, % acierto.
+    Devuelve el wrapper (para poder actualizarlo luego).
+    """
+    wrapper = tk.Frame(parent, bg="#2b2b2b", pady=0)
+    wrapper.pack(fill="x", padx=8, pady=10)
+    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12, relief="ridge", borderwidth=2)
+    card.pack(fill="x")
+    _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list)
+    return wrapper
+
+
+def actualizar_tarjeta_persona(wrapper, track_id, info, photo_refs_list):
+    """Reemplaza el contenido de una tarjeta existente (para mejor match en frame posterior)."""
+    for child in list(wrapper.winfo_children()):
+        child.destroy()
+    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12, relief="ridge", borderwidth=2)
+    card.pack(fill="x")
+    _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list)
 
 
 def run_visor_tkinter(cap, model, fps, writer, args):
     """Vídeo con tracking (ByteTrack), IDs estables y panel lateral con tarjetas por persona."""
     path_video = Path(args.video)
-    cada_n = getattr(args, "cada_n_frames", 12)
+    cada_n = 1  # procesar todos los frames, no saltar ninguno
     max_frames = getattr(args, "max_frames", None)
     imgsz = getattr(args, "imgsz", 320)
     playing = [True]
@@ -675,34 +918,55 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     person_queue = Queue()  # ("new", track_id, info_dict)
     frames_procesados = [0]
     known_track_ids = set()
+    # Mapa track_id -> identidad de usuario (id, nombre, score)
+    track_identity = {}
+    # Último frame en que intentamos reconocer por track_id (para espaciar reintentos)
+    track_last_recog_frame = {}
+    RECOG_RETRY_CADA_FRAMES = 5  # reintentar cada 5 frames (ahorrar CPU, ~6 intentos/seg)
+    # Base de usuarios registrados (cargada en main y pasada en args)
+    usuarios_registrados = getattr(args, "_usuarios_registrados", [])
+    arcface_app = None
 
     root = tk.Tk()
     root.title("Detección ropa — " + path_video.name)
-    root.geometry("1280x750")
+    root.geometry("1600x800")
     root.configure(bg="#2b2b2b")
 
-    # Contenedor principal: izquierda (vídeo) + derecha (panel)
+    # Contenedor principal: 50% vídeo (izq) + 50% panel (der)
     main = tk.Frame(root, bg="#2b2b2b")
     main.pack(fill="both", expand=True, padx=4, pady=4)
+    main.grid_columnconfigure(0, weight=1)
+    main.grid_columnconfigure(1, weight=1)
 
-    # ——— Izquierda: vídeo ———
+    # ——— Izquierda: vídeo (50%) ———
     left = tk.Frame(main, bg="#2b2b2b")
-    left.pack(side="left", fill="both", expand=True)
+    left.grid(row=0, column=0, sticky="nsew")
     lbl_frame = tk.Label(left, text="Frame: 0", font=("Segoe UI", 10), fg="white", bg="#2b2b2b")
     lbl_frame.pack(pady=4)
     lbl_video = tk.Label(left, bg="#1e1e1e")
-    lbl_video.pack(padx=4, pady=2)
+    lbl_video.pack(fill="both", expand=True, padx=4, pady=2)
     photo_ref = [None]
 
-    # ——— Derecha: panel con scroll ———
-    right = tk.Frame(main, bg="#2b2b2b", width=320)
-    right.pack(side="right", fill="y", padx=(8, 0))
-    tk.Label(right, text="Personas detectadas", font=("Segoe UI", 11, "bold"), fg="white", bg="#2b2b2b").pack(pady=(0, 4))
+    # ——— Derecha: panel con scroll (50%), tarjetas separadas ———
+    right = tk.Frame(main, bg="#2b2b2b")
+    right.grid(row=0, column=1, sticky="nsew")
+    tk.Label(right, text="Personas detectadas", font=("Segoe UI", 12, "bold"), fg="white", bg="#2b2b2b").pack(pady=(0, 8))
 
-    canvas = tk.Canvas(right, bg="#2b2b2b", highlightthickness=0)
-    scrollbar = tk.Scrollbar(right, orient="vertical", command=canvas.yview)
+    # Contenedor scroll: canvas + scrollbar
+    scroll_container = tk.Frame(right, bg="#2b2b2b")
+    scroll_container.pack(fill="both", expand=True)
+    canvas = tk.Canvas(scroll_container, bg="#2b2b2b", highlightthickness=0)
+    scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
+
     scrollable = tk.Frame(canvas, bg="#2b2b2b")
-    scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    scrollable_id = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+
+    def _on_frame_configure(event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event):
+        canvas.itemconfig(scrollable_id, width=event.width)
+
     def _on_mousewheel(event):
         if getattr(event, "num", None) == 5:
             canvas.yview_scroll(1, "units")
@@ -710,18 +974,23 @@ def run_visor_tkinter(cap, model, fps, writer, args):
             canvas.yview_scroll(-1, "units")
         elif getattr(event, "delta", 0) != 0:
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    scrollable.bind("<Configure>", _on_frame_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
     canvas.bind_all("<MouseWheel>", _on_mousewheel)
     canvas.bind_all("<Button-4>", _on_mousewheel)
     canvas.bind_all("<Button-5>", _on_mousewheel)
-    canvas.create_window((0, 0), window=scrollable, anchor="nw")
     canvas.configure(yscrollcommand=scrollbar.set)
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
     card_photo_refs = []  # referencias a PhotoImage de las tarjetas
+    card_wrappers = {}  # track_id -> wrapper (para actualizar cuando hay mejor match)
 
     def worker():
+        nonlocal arcface_app
         frame_idx = 0
         last_boxes_with_id = []
+        last_dog_boxes = []
         h_frame, w_frame = None, None
         while playing[0]:
             ret, frame = cap.read()
@@ -741,27 +1010,88 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                 h_frame, w_frame = frame.shape[0], frame.shape[1]
 
             if frame_idx % cada_n == 0:
-                person_boxes, accessory_boxes, comp_por_persona = track_frame(
+                person_boxes, accessory_boxes, comp_por_persona, dog_boxes = track_frame(
                     frame, model, imgsz=imgsz, tracker=getattr(args, "tracker", "botsort.yaml")
                 )
                 last_boxes_with_id = person_boxes
+                last_dog_boxes = dog_boxes
                 for i, (xyxy, conf, tid) in enumerate(person_boxes):
-                    if tid is not None and tid not in known_track_ids:
-                        crop_cara = get_upper_crop(frame, xyxy, h_frame, w_frame)
-                        if crop_cara is not None and has_frontal_face(crop_cara):
-                            known_track_ids.add(tid)
-                            comp_list = comp_por_persona[i] if i < len(comp_por_persona) else []
-                            pose_model = getattr(args, "_pose_model", None)
-                            info = extract_person_info(
-                                frame, xyxy, comp_list, h_frame, w_frame, pose_model=pose_model
-                            )
-                            try:
-                                person_queue.put_nowait(("new", tid, info))
-                            except Exception:
-                                pass
+                    if tid is None:
+                        continue
+
+                    crop_arcface = get_face_crop_for_arcface(frame, xyxy, h_frame, w_frame)
+                    if crop_arcface is None:
+                        continue
+
+                    identidad_actual = track_identity.get(tid)
+                    last_recog = track_last_recog_frame.get(tid, -999)
+                    es_nuevo = tid not in known_track_ids
+                    hubo_mejor_match = False
+
+                    # Reintentar cada RECOG_RETRY_CADA_FRAMES mientras la persona siga visible
+                    debe_intentar = es_nuevo or (frame_idx - last_recog >= RECOG_RETRY_CADA_FRAMES)
+                    if debe_intentar:
+                        track_last_recog_frame[tid] = frame_idx
+                        if arcface_app is None:
+                            arcface_app = get_arcface_app()
+                        identidad, has_face, edad_face, genero_face = identificar_cara_arcface(
+                            crop_arcface, usuarios_registrados or [], arcface_app,
+                            debug=getattr(args, "debug_face", False),
+                            frame_idx=frame_idx,
+                        )
+                        if not has_face:
+                            if es_nuevo:
+                                continue
+                        else:
+                            if identidad is not None:
+                                score_nuevo = identidad.get("score", 0)
+                                identidad["edad"] = edad_face
+                                identidad["genero"] = genero_face
+                                score_actual = (identidad_actual.get("score") or 0) if (identidad_actual and identidad_actual.get("nombre")) else -1
+                                if score_nuevo > score_actual:
+                                    track_identity[tid] = identidad
+                                    identidad_actual = identidad
+                                    hubo_mejor_match = True
+                            else:
+                                if identidad_actual is None or not identidad_actual.get("nombre"):
+                                    track_identity[tid] = {"edad": edad_face, "genero": genero_face}
+                                    identidad_actual = track_identity[tid]
+
+                    if es_nuevo:
+                        known_track_ids.add(tid)
+
+                    identidad = track_identity.get(tid)
+                    comp_list = comp_por_persona[i] if i < len(comp_por_persona) else []
+                    pose_model = getattr(args, "_pose_model", None)
+                    info = extract_person_info(
+                        frame, xyxy, comp_list, h_frame, w_frame, pose_model=pose_model
+                    )
+
+                    if identidad is not None and identidad.get("nombre"):
+                        info["identificado"] = True
+                        info["user_id"] = identidad.get("id")
+                        info["user_nombre"] = identidad.get("nombre", "desconocido")
+                        info["user_score"] = identidad.get("score")
+                        info["edad"] = identidad.get("edad")
+                        info["genero"] = identidad.get("genero")
+                        info["pct_acierto"] = int(round((identidad.get("score") or 0) * 100))
+                    else:
+                        info["identificado"] = False
+                        info["user_nombre"] = "desconocido"
+                        info["edad"] = identidad.get("edad") if identidad else None
+                        info["genero"] = identidad.get("genero") if identidad else None
+                    info["crop_cara"] = crop_arcface.copy()
+
+                    try:
+                        if es_nuevo:
+                            person_queue.put_nowait(("new", tid, info))
+                        elif hubo_mejor_match:
+                            person_queue.put_nowait(("update", tid, info))
+                    except Exception:
+                        pass
 
             frame_dibujo = frame.copy()
-            dibujar_cajas_track(frame_dibujo, last_boxes_with_id)
+            dibujar_cajas_track(frame_dibujo, last_boxes_with_id, track_identity, last_dog_boxes)
             if writer is not None:
                 writer.write(frame_dibujo)
             try:
@@ -782,9 +1112,9 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                     lbl_frame.config(text=f"Frame: {idx} — Fin del vídeo" if idx >= 0 else "Fin del vídeo")
                     root.after(40, poll_queue)
                     return
-                photo_ref[0] = frame_bgr_a_photoimage(frame_dibujo)
+                photo_ref[0] = frame_bgr_a_photoimage(frame_dibujo, max_ancho=960, max_alto=720)
                 lbl_video.config(image=photo_ref[0])
-                lbl_frame.config(text=f"Frame: {idx} (cada {cada_n} frames)")
+                lbl_frame.config(text=f"Frame: {idx}")
         except Empty:
             pass
         try:
@@ -792,14 +1122,22 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                 msg = person_queue.get_nowait()
                 if msg[0] == "new":
                     _, track_id, info = msg
-                    crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
+                    wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
+                    card_wrappers[track_id] = wrapper
                     canvas.configure(scrollregion=canvas.bbox("all"))
+                elif msg[0] == "update":
+                    _, track_id, info = msg
+                    if track_id in card_wrappers:
+                        actualizar_tarjeta_persona(card_wrappers[track_id], track_id, info, card_photo_refs)
+                        canvas.configure(scrollregion=canvas.bbox("all"))
         except Empty:
             pass
         root.after(40, poll_queue)
 
     def on_cerrar():
         playing[0] = False
+        cap.release()  # El worker recibirá ret=False y saldrá limpio del loop
+        th.join(timeout=2.0)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_cerrar)
@@ -820,7 +1158,7 @@ def main():
     parser.add_argument(
         "video",
         type=str,
-        help="Ruta al fichero de vídeo",
+        help="Nombre del vídeo (se concatena con PATH_VIDEOS) o ruta absoluta al fichero",
     )
     parser.add_argument(
         "--model",
@@ -875,9 +1213,18 @@ def main():
         action="store_true",
         help="Desactivar pose (usar mitad superior/inferior para color, sin segmentación)",
     )
+    parser.add_argument(
+        "--debug-face",
+        action="store_true",
+        help="Imprimir scores de similitud al intentar identificar caras (diagnóstico)",
+    )
     args = parser.parse_args()
 
-    path_video = Path(args.video)
+    # Si el argumento es una ruta absoluta, usarla tal cual; si no, concatenar con PATH_VIDEOS
+    video_arg = args.video
+    path_video = Path(video_arg)
+    if not path_video.is_absolute():
+        path_video = Path(PATH_VIDEOS) / video_arg
     if not path_video.exists():
         print(f"Error: no existe el fichero '{args.video}'", file=sys.stderr)
         sys.exit(1)
@@ -888,6 +1235,8 @@ def main():
     if args.mostrar and not args.no_pose:
         print("Cargando modelo YOLO-pose para segmentación de torso/color...")
         args._pose_model = YOLO(args.pose_model)
+    # Base de usuarios registrados (para identificación con ArcFace)
+    args._usuarios_registrados = load_registered_users()
     cap = cv2.VideoCapture(str(path_video))
     if not cap.isOpened():
         print(f"Error: no se pudo abrir el vídeo '{args.video}'", file=sys.stderr)
