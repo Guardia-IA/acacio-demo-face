@@ -178,6 +178,8 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
     pose_buckets = {"frontal": [], "izq": [], "der": []}
     frame_queue = Queue(maxsize=2)
     playing = [True]
+    # Flag para no guardar dos veces la parametrización
+    registro_guardado = [False]
     # Metadatos estimados del usuario (edad, género) usando InsightFace
     user_meta = {"edad": None, "genero": None}
 
@@ -346,6 +348,16 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
                 frame_queue.put_nowait((frame_dibujo, {"frontal": nf, "izq": ni, "der": nd, "_total": total_frames}, frame_idx, total_frames, False))
             except Exception:
                 pass
+
+            # Si ya hemos alcanzado el máximo de frames por pose en las tres poses,
+            # podemos terminar el procesado aunque el vídeo sea más largo.
+            if (
+                nf >= MAX_FRAMES_POR_POSE
+                and ni >= MAX_FRAMES_POR_POSE
+                and nd >= MAX_FRAMES_POR_POSE
+            ):
+                break
+
             frame_idx += 1
 
         try:
@@ -395,6 +407,8 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
 
     def guardar_parametrizacion(encodings_list, id_persona, nombre, path_out, user_meta):
         """Guarda en face_tracking/<id>_<nombre>.pkl el embedding medio (512-d) y metadatos para ArcFace."""
+        if registro_guardado[0]:
+            return
         if not encodings_list:
             return
         encodings_arr = np.array(encodings_list, dtype=np.float32)
@@ -425,6 +439,7 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
                 data["genero"] = user_meta["genero"]
         with open(path_out, "wb") as f:
             pickle.dump(data, f)
+        registro_guardado[0] = True
         print(f"Parametrización guardada en: {path_out}")
         # Registrar en JSON global para que test_detect_clothes.py pueda identificar usuarios
         registrar_usuario(
@@ -436,7 +451,10 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
         )
 
     def on_cerrar():
+        # Al cerrar manualmente, si ya tenemos encodings pero aún no se ha guardado, guardar ahora.
         playing[0] = False
+        if encodings_recogidos and not registro_guardado[0]:
+            guardar_parametrizacion(encodings_recogidos, id_persona, nombre, path_out, user_meta)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_cerrar)

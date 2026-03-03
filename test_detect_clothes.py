@@ -805,17 +805,6 @@ def _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list):
     # Nombre
     tk.Label(card, text=f"Nombre: {user_name}", font=("Segoe UI", 10), fg="#ddd", bg="#3d3d3d").pack(anchor="w")
 
-    # Sexo y edad estimada
-    genero = info.get("genero")
-    edad = info.get("edad")
-    sexo_txt = str(genero) if genero is not None else "—"
-    edad_txt = str(edad) if edad is not None else "—"
-    tk.Label(card, text=f"Sexo: {sexo_txt} | Edad: {edad_txt}", font=("Segoe UI", 10), fg="#ccc", bg="#3d3d3d").pack(anchor="w")
-
-    # Similitud (0-100) si identificado — coseno entre embeddings
-    if info.get("identificado") and info.get("pct_acierto") is not None:
-        tk.Label(card, text=f"Similitud: {info['pct_acierto']}% (sobre 100)", font=("Segoe UI", 10), fg="#40c040", bg="#3d3d3d").pack(anchor="w", pady=(2, 0))
-
     # Ropa superior: [cuadro color] texto (nombre + hex)
     row_sup = tk.Frame(card, bg="#3d3d3d")
     row_sup.pack(fill="x", pady=2)
