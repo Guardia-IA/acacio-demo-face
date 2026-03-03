@@ -24,6 +24,19 @@ from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import ttk
 
+# Optimización CPU/GPU: detectar CUDA (para InsightFace) y limitar hilos en CPU
+HAS_CUDA = False
+INSIGHTFACE_CTX_ID = -1
+try:
+    import torch
+
+    HAS_CUDA = torch.cuda.is_available()
+    INSIGHTFACE_CTX_ID = 0 if HAS_CUDA else -1
+    torch.set_num_threads(min(4, torch.get_num_threads()))
+except Exception:
+    HAS_CUDA = False
+    INSIGHTFACE_CTX_ID = -1
+
 # InsightFace (ArcFace): carga perezosa para no ralentizar el arranque
 _app_insightface = None
 
@@ -34,7 +47,11 @@ def get_face_app():
         from insightface.app import FaceAnalysis
         # buffalo_l; det_size mayor en registro para embeddings de mejor calidad
         _app_insightface = FaceAnalysis(name="buffalo_l", root=str(Path.home() / ".insightface"))
-        _app_insightface.prepare(ctx_id=-1, det_thresh=0.4, det_size=(512, 512))
+        try:
+            _app_insightface.prepare(ctx_id=INSIGHTFACE_CTX_ID, det_thresh=0.4, det_size=(512, 512))
+        except Exception:
+            # Si falla en GPU, reintentar en CPU
+            _app_insightface.prepare(ctx_id=-1, det_thresh=0.4, det_size=(512, 512))
     return _app_insightface
 
 # Mínimo por pose para considerar "mínima calidad"; seguimos capturando hasta el máximo

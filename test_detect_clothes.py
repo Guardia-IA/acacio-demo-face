@@ -21,18 +21,26 @@ from queue import Empty, Queue
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-from sklearn.cluster import KMeans
 from ultralytics import YOLO
 import tkinter as tk
 
-# Optimización CPU: limitar hilos de PyTorch (evita sobrecarga, suele mejorar throughput)
+# Optimización CPU/GPU: limitar hilos en CPU y detectar CUDA
+HAS_CUDA = False
+DEVICE = "cpu"
 try:
     import torch
+
+    HAS_CUDA = torch.cuda.is_available()
+    DEVICE = "cuda" if HAS_CUDA else "cpu"
     torch.set_num_threads(min(4, torch.get_num_threads()))
 except Exception:
-    pass
+    HAS_CUDA = False
+    DEVICE = "cpu"
 
-PATH_VIDEOS = "/home/debian/sharedVM/sergi_reconocimiento_facial/finales"
+PATH_VIDEOS = "/home/debian/sharedVM/sergi_reconocimiento_facial/finalesv2"
+# Modelos YOLO por defecto (puedes cambiarlos fácil para probar otros)
+YOLO_MODEL = "yolo11x.pt"
+YOLO_MODEL_POSE = "yolo11x-pose.pt"
 
 # Suprimir FutureWarning de InsightFace (skimage: tform.estimate deprecado)
 warnings.filterwarnings("ignore", message=".*estimate.*deprecated.*", category=FutureWarning)
@@ -57,7 +65,13 @@ def get_arcface_app():
         root_dir = Path.home() / ".insightface"
         app = FaceAnalysis(name="buffalo_l", root=str(root_dir))
         # det_size mayor para detectar caras pequeñas (persona lejos en 4K)
-        app.prepare(ctx_id=-1, det_thresh=0.4, det_size=(640, 640))
+        # ctx_id: 0→GPU si hay CUDA, -1→CPU
+        ctx_id = 0 if HAS_CUDA else -1
+        try:
+            app.prepare(ctx_id=ctx_id, det_thresh=0.4, det_size=(640, 640))
+        except Exception:
+            # Si falla en GPU, reintentar en CPU
+            app.prepare(ctx_id=-1, det_thresh=0.4, det_size=(640, 640))
         _arcface_app = app
     return _arcface_app
 
@@ -121,43 +135,43 @@ def identificar_cara_arcface(crop_bgr, usuarios_db, app_arcface, sim_threshold=0
     """
     Obtiene embedding ArcFace de crop_bgr y lo compara con la base de usuarios.
     Usa best-of-N: compara con todos los encodings guardados de cada usuario y toma el mejor score.
-    Devuelve (identidad, has_face, edad, genero): identidad dict o None; edad/genero desde InsightFace.
+    Devuelve (identidad, has_face, edad, genero, embedding): identidad dict o None; embedding para re-ID.
     """
     if crop_bgr is None or crop_bgr.size == 0 or app_arcface is None:
-        return None, False, None, None
+        return None, False, None, None, None
     img = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     faces = app_arcface.get(img)
     if not faces:
-        return None, False, None, None
+        return None, False, None, None, None
     face = faces[0]
     edad = int(face.age) if hasattr(face, "age") and face.age is not None else None
     genero = "hombre" if (hasattr(face, "gender") and face.gender == 0) else ("mujer" if (hasattr(face, "gender") and face.gender == 1) else None)
     if not hasattr(face, "embedding") or face.embedding is None:
-        return None, True, edad, genero
-    if not usuarios_db:
-        return None, True, edad, genero
+        return None, True, edad, genero, None
     emb = np.asarray(face.embedding, dtype=np.float32)
     nrm = np.linalg.norm(emb)
     if nrm > 1e-6:
         emb = emb / nrm
+    if not usuarios_db:
+        return None, True, edad, genero, emb
     best_score = -1.0
     best_user = None
-    scores_per_user = []
+    scores_per_user = [] if debug else None
     for u in usuarios_db:
         encodings = u.get("encodings", [u["encoding"]])
         best_u = max(float(np.dot(vec, emb)) for vec in encodings)
-        scores_per_user.append((u, best_u))
+        if debug:
+            scores_per_user.append((u, best_u))
         if best_u > best_score:
             best_score = best_u
             best_user = u
-    if debug and usuarios_db:
+    if debug and scores_per_user:
         frame_pref = f"Frame {frame_idx} | " if frame_idx is not None else ""
-        pkl_names = [Path(u["pkl_path"]).name for u in usuarios_db]
-        log_parts = [f"{u['nombre']} ({pk}): {s:.3f}" for (u, s), pk in zip(scores_per_user, pkl_names)]
+        log_parts = [f"{u['nombre']} ({Path(u['pkl_path']).name}): {s:.3f}" for u, s in scores_per_user]
         print(f"  [debug-face] {frame_pref}similaridad vs .pkl → {', '.join(log_parts)} | umbral={sim_threshold} | {'MATCH' if best_user and best_score >= sim_threshold else 'no match'}")
     if best_user is not None and best_score >= sim_threshold:
-        return {"id": best_user["id"], "nombre": best_user["nombre"], "score": best_score}, True, edad, genero
-    return None, True, edad, genero
+        return {"id": best_user["id"], "nombre": best_user["nombre"], "score": best_score}, True, edad, genero, emb
+    return None, True, edad, genero, emb
 
 def get_upper_crop(frame, xyxy, h_frame, w_frame, ratio=0.45):
     """Recorte de la parte superior de la bbox (zona cara/hombros) para comprobar cara frontal."""
@@ -191,17 +205,28 @@ def get_face_crop_for_arcface(frame, xyxy, h_frame, w_frame, ratio=0.55, min_sid
     return crop
 
 
-# COCO pose keypoints: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee
-KPT_SHOULDERS = (5, 6)
-KPT_HIPS = (11, 12)
-KPT_KNEES = (13, 14)
+# COCO pose: solo los índices que necesitamos (torso 4 pts, piernas 6 pts)
+# 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee, 15=L_ankle, 16=R_ankle
+IDX_TORSO = (5, 6, 11, 12)  # hombros + caderas
+IDX_PIERNAS = (11, 12, 13, 14, 15, 16)  # caderas, rodillas, tobillos
 
 
-def get_torso_regions_from_pose(crop_bgr, pose_model, conf_min=0.25):
+def _get_pts_validos(xy, conf, indices, conf_min=0.25):
+    """Devuelve lista de (x,y) para los índices indicados si conf >= conf_min."""
+    pts = []
+    for i in indices:
+        if i < xy.shape[0] and i < len(conf) and conf[i] >= conf_min:
+            pts.append((float(xy[i][0]), float(xy[i][1])))
+    return pts
+
+
+def get_torso_y_piernas_from_pose(crop_bgr, pose_model, conf_min=0.25):
     """
-    Usa YOLO-pose para definir torso (hombros→caderas) y parte inferior (caderas→rodillas).
-    Devuelve (zona_torso_sup, zona_torso_inf) como recortes BGR, o (None, None) si falla.
-    Excluye cara/pelo/brazos y enfoca la ropa.
+    Usa YOLO-pose (solo keypoints necesarios) para:
+    a) Torso: bbox con 4 puntos (hombros + caderas) → color más común
+    b) Piernas: bbox desde caderas hasta tobillos (cadera→rodilla→pie por cada lado)
+    Devuelve (zona_torso, zona_piernas) como recortes BGR para captura y color.
+    No dibuja esqueleto.
     """
     if crop_bgr is None or crop_bgr.size == 0 or pose_model is None:
         return None, None
@@ -216,54 +241,34 @@ def get_torso_regions_from_pose(crop_bgr, pose_model, conf_min=0.25):
         kpts = r.keypoints
         if kpts is None:
             return None, None
-        # xy: (n_persons, 17, 2), conf: (n_persons, 17)
         xy = kpts.xy[0].cpu().numpy() if len(kpts.xy) > 0 else None
         conf = kpts.conf[0].cpu().numpy() if len(kpts.conf) > 0 else None
-        if xy is None or conf is None or xy.shape[0] < 13:
+        if xy is None or conf is None or xy.shape[0] < 17:
             return None, None
     except Exception:
         return None, None
 
-    def get_points(indices):
-        pts = []
-        for i in indices:
-            if i < len(xy) and i < len(conf) and conf[i] >= conf_min:
-                pts.append((float(xy[i][0]), float(xy[i][1])))
-        return pts
+    def _bbox_from_pts(pts, mw, mh):
+        ys, xs = [p[1] for p in pts], [p[0] for p in pts]
+        y1 = max(0, int(min(ys)) - mh)
+        y2 = min(h_crop, int(max(ys)) + mh)
+        x1 = max(0, int(min(xs)) - mw)
+        x2 = min(w_crop, int(max(xs)) + mw)
+        if y2 > y1 and x2 > x1:
+            return crop_bgr[y1:y2, x1:x2].copy()
+        return None
 
-    shoulders = get_points(KPT_SHOULDERS)
-    hips = get_points(KPT_HIPS)
-    knees = get_points(KPT_KNEES)
-    if not shoulders or not hips:
-        return None, None
+    margin = 0.08
+    mw = max(2, int(w_crop * margin))
+    mh = max(2, int(h_crop * margin))
 
-    margin = 0.05
-    mw = int(w_crop * margin)
-    mh = int(h_crop * margin)
+    pts_torso = _get_pts_validos(xy, conf, IDX_TORSO, conf_min)
+    zona_torso = _bbox_from_pts(pts_torso, mw, mh) if len(pts_torso) >= 3 else None
 
-    # Torso: hombros -> caderas (ropa superior)
-    y_top = max(0, int(min(p[1] for p in shoulders)) - mh)
-    y_bot = min(h_crop - 1, int(max(p[1] for p in hips)) + mh)
-    all_x = [p[0] for p in shoulders + hips]
-    x_left = max(0, int(min(all_x)) - mw)
-    x_right = min(w_crop - 1, int(max(all_x)) + mw)
-    if y_bot > y_top and x_right > x_left:
-        zona_torso = crop_bgr[y_top:y_bot, x_left:x_right].copy()
-    else:
-        zona_torso = None
+    pts_piernas = _get_pts_validos(xy, conf, IDX_PIERNAS, conf_min)
+    zona_piernas = _bbox_from_pts(pts_piernas, mw, mh) if len(pts_piernas) >= 4 else None
 
-    # Parte inferior: caderas -> rodillas (ropa inferior)
-    zona_inf = None
-    if hips and knees:
-        y_top_inf = max(0, int(min(p[1] for p in hips)) - mh)
-        y_bot_inf = min(h_crop - 1, int(max(p[1] for p in knees)) + mh)
-        all_x_inf = [p[0] for p in hips + knees]
-        x_left_inf = max(0, int(min(all_x_inf)) - mw)
-        x_right_inf = min(w_crop - 1, int(max(all_x_inf)) + mw)
-        if y_bot_inf > y_top_inf and x_right_inf > x_left_inf:
-            zona_inf = crop_bgr[y_top_inf:y_bot_inf, x_left_inf:x_right_inf].copy()
-
-    return zona_torso, zona_inf
+    return zona_torso, zona_piernas
 
 
 # Clases COCO: persona, perro y complementos vestimentarios
@@ -473,7 +478,8 @@ def asociar_complementos_a_personas(person_boxes, accessory_boxes):
             p_xyxy = item[0] if len(item) >= 1 else item
             if centro_en_box(acc_cx, acc_cy, p_xyxy):
                 iou = iou_box(p_xyxy, acc_xyxy)
-                if iou > mejor_iou or (iou == 0 and centro_en_box(acc_cx, acc_cy, p_xyxy)):
+                # centro_en_box ya es True aquí; actualizar si mejor IoU o sin match previo
+                if iou > mejor_iou or mejor_iou == 0:
                     mejor_iou = iou
                     mejor_idx = i
         if mejor_idx >= 0:
@@ -590,6 +596,23 @@ def track_frame(frame, model, imgsz=320, tracker="botsort.yaml"):
     return person_boxes, accessory_boxes, comp_por_persona, dog_boxes
 
 
+def _zoom_region_for_color(region_bgr, min_side=160):
+    """
+    Hace un pequeño "zoom" (upscale) sobre la región antes de estimar el color
+    para ganar estabilidad cuando la persona está lejos o la bbox es pequeña.
+    No añade información nueva, pero mejora la cuantización de color.
+    """
+    if region_bgr is None or region_bgr.size == 0:
+        return region_bgr
+    h, w = region_bgr.shape[:2]
+    if min(h, w) >= min_side:
+        return region_bgr
+    escala = float(min_side) / float(min(h, w))
+    nw = max(min_side, int(w * escala))
+    nh = max(min_side, int(h * escala))
+    return cv2.resize(region_bgr, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+
+
 def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=None):
     """
     Extrae para una persona: thumbnail (zona cara/arriba), color superior, inferior, complementos con color.
@@ -620,28 +643,27 @@ def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=Non
     thumb = frame[y1 : y1 + h_thumb, x1:x2].copy()
     thumb = cv2.resize(thumb, (96, 112), interpolation=cv2.INTER_AREA)
 
-    # Color superior e inferior: usar pose si está disponible (segmentación más precisa)
-    zona_torso, zona_inf_pose = None, None
+    # Color superior e inferior: YOLO-pose (solo keypoints torso y piernas).
+    # Si no hay puntos válidos, NO inventar el color: marcar como desconocido.
+    zona_torso, zona_piernas = None, None
     if pose_model is not None:
-        zona_torso, zona_inf_pose = get_torso_regions_from_pose(crop, pose_model)
+        zona_torso, zona_piernas = get_torso_y_piernas_from_pose(crop, pose_model)
 
     if zona_torso is not None and zona_torso.size > 0:
-        color_sup = color_dominante_region(zona_torso)
-        region_sup = zona_torso.copy()
+        zona_torso_zoom = _zoom_region_for_color(zona_torso, min_side=160)
+        color_sup = color_dominante_region(zona_torso_zoom)
+        region_sup = zona_torso_zoom.copy()
     else:
-        mitad = h_crop // 2
-        zona_sup = crop[:mitad, :]
-        color_sup = color_dominante_region(zona_sup)
-        region_sup = zona_sup.copy()
+        color_sup = {"hex": "#505050", "nombre": "desconocido"}
+        region_sup = None
 
-    if zona_inf_pose is not None and zona_inf_pose.size > 0:
-        color_inf = color_dominante_region(zona_inf_pose)
-        region_inf = zona_inf_pose.copy()
+    if zona_piernas is not None and zona_piernas.size > 0:
+        zona_piernas_zoom = _zoom_region_for_color(zona_piernas, min_side=160)
+        color_inf = color_dominante_region(zona_piernas_zoom)
+        region_inf = zona_piernas_zoom.copy()
     else:
-        mitad = h_crop // 2
-        zona_inf = crop[mitad:, :]
-        color_inf = color_dominante_region(zona_inf)
-        region_inf = zona_inf.copy()
+        color_inf = {"hex": "#505050", "nombre": "desconocido"}
+        region_inf = None
 
     complementos = []
     for nombre, acc_xyxy in comp_list:
@@ -650,7 +672,8 @@ def extract_person_info(frame, xyxy, comp_list, h_frame, w_frame, pose_model=Non
         ax2, ay2 = min(w_frame, ax2), min(h_frame, ay2)
         if ax2 > ax1 and ay2 > ay1:
             acc_crop = frame[ay1:ay2, ax1:ax2]
-            c = color_dominante_region(acc_crop)
+            acc_crop_zoom = _zoom_region_for_color(acc_crop, min_side=120)
+            c = color_dominante_region(acc_crop_zoom)
             complementos.append({"nombre": nombre, "color": c["nombre"], "color_hex": c["hex"]})
         else:
             complementos.append({"nombre": nombre, "color": "no detectable", "color_hex": "#505050"})
@@ -777,111 +800,114 @@ def crop_cara_a_photoimage(crop_bgr, tam=120):
 
 def _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list):
     """Llena el contenido de una tarjeta (reutilizable para crear y actualizar)."""
+    card.configure(bg="#3d3d3d")
+
+    # --------- Fila 0-1: cara + ID / Nombre ----------
+    face_col = tk.Frame(card, bg="#3d3d3d")
+    face_col.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 10), pady=(0, 4))
+
     # Crop de la cara (solo rostro)
     crop_cara = info.get("crop_cara")
+    img_face = None
     if crop_cara is not None:
-        ph = crop_cara_a_photoimage(crop_cara)
-        if ph is not None:
-            photo_refs_list.append(ph)
-            tk.Label(card, image=ph, bg="#3d3d3d").pack(pady=(0, 6))
+        img_face = crop_cara_a_photoimage(crop_cara)
     else:
-        crop_persona = info.get("crop_persona")
-        if crop_persona is None:
-            crop_persona = info.get("thumbnail")
+        crop_persona = info.get("crop_persona") or info.get("thumbnail")
         if crop_persona is not None:
-            ph = crop_a_photoimage(crop_persona)
-            if ph is not None:
-                photo_refs_list.append(ph)
-                tk.Label(card, image=ph, bg="#3d3d3d").pack(pady=(0, 6))
-        else:
-            tk.Label(card, text="[Sin imagen]", bg="#3d3d3d", fg="#888").pack(pady=(0, 6))
+            img_face = crop_a_photoimage(crop_persona, ancho=160, alto=200)
+    if img_face is not None:
+        photo_refs_list.append(img_face)
+        tk.Label(face_col, image=img_face, bg="#3d3d3d").pack()
+    else:
+        tk.Label(face_col, text="[Sin imagen]", bg="#3d3d3d", fg="#888").pack()
+
+    info_col = tk.Frame(card, bg="#3d3d3d")
+    info_col.grid(row=0, column=1, sticky="w", pady=(0, 4))
 
     # ID: track_id o user_id si identificado
     user_id = info.get("user_id")
     user_name = info.get("user_nombre", "desconocido")
     id_txt = f"ID: {user_id}" if user_id is not None else f"Track ID: {track_id}"
-    tk.Label(card, text=id_txt, font=("Segoe UI", 10, "bold"), fg="white", bg="#3d3d3d").pack(anchor="w")
+    tk.Label(info_col, text=id_txt, font=("Segoe UI", 10, "bold"), fg="white", bg="#3d3d3d").pack(anchor="w")
 
-    # Nombre
-    tk.Label(card, text=f"Nombre: {user_name}", font=("Segoe UI", 10), fg="#ddd", bg="#3d3d3d").pack(anchor="w")
-
-    # Ropa superior: [cuadro color] texto (nombre + hex)
-    row_sup = tk.Frame(card, bg="#3d3d3d")
-    row_sup.pack(fill="x", pady=2)
-    tk.Label(row_sup, text="Ropa superior:", font=("Segoe UI", 9), fg="#ccc", bg="#3d3d3d").pack(side="left")
-    hex_sup = info.get("color_superior_hex") or nombre_color_a_hex(info.get("color_superior", "no detectable"))
-    tk.Label(row_sup, text="", width=2, bg=hex_sup, relief="solid", borderwidth=1).pack(side="left", padx=4)
-    txt_sup = info.get("color_superior", "—")
-    if info.get("color_superior_hex"):
-        txt_sup += f" ({info['color_superior_hex']})"
-    tk.Label(row_sup, text=txt_sup, font=("Segoe UI", 9), fg="white", bg="#3d3d3d").pack(side="left")
-
-    # Segmentación parte superior (imagen de la región usada)
-    if info.get("region_superior") is not None:
-        try:
-            ph_sup = thumbnail_a_photoimage(info["region_superior"], ancho=100, alto=70)
-            if ph_sup is not None:
-                photo_refs_list.append(ph_sup)
-                tk.Label(card, text="Segmentación superior (región usada):", font=("Segoe UI", 8), fg="#888", bg="#3d3d3d").pack(anchor="w")
-                tk.Label(card, image=ph_sup, bg="#3d3d3d", relief="solid", borderwidth=1).pack(anchor="w", pady=(0, 4))
-        except Exception:
-            pass
-
-    # Ropa inferior
-    row_inf = tk.Frame(card, bg="#3d3d3d")
-    row_inf.pack(fill="x", pady=2)
-    tk.Label(row_inf, text="Ropa inferior:", font=("Segoe UI", 9), fg="#ccc", bg="#3d3d3d").pack(side="left")
-    hex_inf = info.get("color_inferior_hex") or nombre_color_a_hex(info.get("color_inferior", "no detectable"))
-    tk.Label(row_inf, text="", width=2, bg=hex_inf, relief="solid", borderwidth=1).pack(side="left", padx=4)
-    txt_inf = info.get("color_inferior", "—")
-    if info.get("color_inferior_hex"):
-        txt_inf += f" ({info['color_inferior_hex']})"
-    tk.Label(row_inf, text=txt_inf, font=("Segoe UI", 9), fg="white", bg="#3d3d3d").pack(side="left")
-
-    # Segmentación parte inferior (imagen de la región usada)
-    if info.get("region_inferior") is not None:
-        try:
-            ph_inf = thumbnail_a_photoimage(info["region_inferior"], ancho=100, alto=70)
-            if ph_inf is not None:
-                photo_refs_list.append(ph_inf)
-                tk.Label(card, text="Segmentación inferior (región usada):", font=("Segoe UI", 8), fg="#888", bg="#3d3d3d").pack(anchor="w")
-                tk.Label(card, image=ph_inf, bg="#3d3d3d", relief="solid", borderwidth=1).pack(anchor="w", pady=(0, 4))
-        except Exception:
-            pass
-
-    # Complementos: tipo + [cuadro color] color
-    comps = info.get("complementos", [])
-    if comps:
-        tk.Label(card, text="Complementos:", font=("Segoe UI", 9), fg="#ccc", bg="#3d3d3d").pack(anchor="w")
-        for c in comps:
-            fcomp = tk.Frame(card, bg="#3d3d3d")
-            fcomp.pack(fill="x", padx=(12, 0))
-            tk.Label(fcomp, text=c.get("nombre", ""), font=("Segoe UI", 9), fg="white", bg="#3d3d3d").pack(side="left")
-            hex_c = c.get("color_hex") or nombre_color_a_hex(c.get("color", "no detectable"))
-            tk.Label(fcomp, text="", width=2, bg=hex_c, relief="solid", borderwidth=1).pack(side="left", padx=4)
-            tk.Label(fcomp, text=c.get("color", "—"), font=("Segoe UI", 9), fg="#aaa", bg="#3d3d3d").pack(side="left")
-    else:
-        tk.Label(card, text="Complementos: ninguno", font=("Segoe UI", 9), fg="#888", bg="#3d3d3d").pack(anchor="w")
-
-    # Identificado: Sí/No
+    # Nombre (verde si está identificado)
     identificado = info.get("identificado", False)
-    if identificado:
-        txt_id = "Identificado: Sí"
-        color = "#40c040"
-    else:
-        txt_id = "Identificado: No"
-        color = "#f0a030"
-    tk.Label(card, text=txt_id, font=("Segoe UI", 9), fg=color, bg="#3d3d3d").pack(anchor="w", pady=(4, 0))
+    nombre_color = "#40c040" if identificado else "#ddd"
+    tk.Label(info_col, text=f"Nombre: {user_name}", font=("Segoe UI", 10), fg=nombre_color, bg="#3d3d3d").pack(anchor="w")
+
+    # Separador 1
+    sep1 = tk.Frame(card, bg="#555555", height=1)
+    sep1.grid(row=1, column=1, sticky="ew", pady=(6, 6))
+
+    # --------- Bloque ropa superior ----------
+    sup_row = tk.Frame(card, bg="#3d3d3d")
+    sup_row.grid(row=2, column=1, sticky="w")
+
+    # Mini foto de región superior
+    foto_sup = info.get("region_superior")
+    if foto_sup is not None:
+        ph_sup = thumbnail_a_photoimage(foto_sup, ancho=80, alto=60)
+        if ph_sup is not None:
+            photo_refs_list.append(ph_sup)
+            tk.Label(sup_row, image=ph_sup, bg="#3d3d3d").pack(side="left", padx=(0, 8))
+
+    sup_text = tk.Frame(sup_row, bg="#3d3d3d")
+    sup_text.pack(side="left")
+    tk.Label(sup_text, text="Ropa superior", font=("Segoe UI", 9, "bold"), fg="#ccc", bg="#3d3d3d").pack(anchor="w")
+    hex_sup = info.get("color_superior_hex") or nombre_color_a_hex(info.get("color_superior", "no detectable"))
+    txt_sup = info.get("color_superior", "—")
+    fila_sup = tk.Frame(sup_text, bg="#3d3d3d")
+    fila_sup.pack(anchor="w")
+    tk.Label(fila_sup, text="Color:", font=("Segoe UI", 9), fg="#ccc", bg="#3d3d3d").pack(side="left")
+    tk.Label(fila_sup, text="", width=2, bg=hex_sup, relief="solid", borderwidth=1).pack(side="left", padx=4)
+    tk.Label(fila_sup, text=f"{txt_sup} ({hex_sup})", font=("Segoe UI", 9), fg="white", bg="#3d3d3d").pack(side="left")
+
+    # Separador 2
+    sep2 = tk.Frame(card, bg="#555555", height=1)
+    sep2.grid(row=3, column=1, sticky="ew", pady=(6, 6))
+
+    # --------- Bloque ropa inferior ----------
+    inf_row = tk.Frame(card, bg="#3d3d3d")
+    inf_row.grid(row=4, column=1, sticky="w")
+
+    foto_inf = info.get("region_inferior")
+    if foto_inf is not None:
+        ph_inf = thumbnail_a_photoimage(foto_inf, ancho=80, alto=60)
+        if ph_inf is not None:
+            photo_refs_list.append(ph_inf)
+            tk.Label(inf_row, image=ph_inf, bg="#3d3d3d").pack(side="left", padx=(0, 8))
+
+    inf_text = tk.Frame(inf_row, bg="#3d3d3d")
+    inf_text.pack(side="left")
+    tk.Label(inf_text, text="Ropa inferior", font=("Segoe UI", 9, "bold"), fg="#ccc", bg="#3d3d3d").pack(anchor="w")
+    hex_inf = info.get("color_inferior_hex") or nombre_color_a_hex(info.get("color_inferior", "no detectable"))
+    txt_inf = info.get("color_inferior", "—")
+    fila_inf = tk.Frame(inf_text, bg="#3d3d3d")
+    fila_inf.pack(anchor="w")
+    tk.Label(fila_inf, text="Color:", font=("Segoe UI", 9), fg="#ccc", bg="#3d3d3d").pack(side="left")
+    tk.Label(fila_inf, text="", width=2, bg=hex_inf, relief="solid", borderwidth=1).pack(side="left", padx=4)
+    tk.Label(fila_inf, text=f"{txt_inf} ({hex_inf})", font=("Segoe UI", 9), fg="white", bg="#3d3d3d").pack(side="left")
 
 
 def crear_tarjeta_persona(parent, track_id, info, photo_refs_list):
     """
-    Crea una tarjeta independiente en el panel: crop, id, nombre, sexo, edad, % acierto.
+    Crea una tarjeta independiente en el panel: foto, id, nombre, ropa superior/inferior.
     Devuelve el wrapper (para poder actualizarlo luego).
     """
-    wrapper = tk.Frame(parent, bg="#2b2b2b", pady=0)
-    wrapper.pack(fill="x", padx=8, pady=10)
-    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12, relief="ridge", borderwidth=2)
+    identificado = info.get("identificado", False)
+    borde_color = "#00c040" if identificado else "#0070ff"
+    wrapper = tk.Frame(
+        parent,
+        bg="#2b2b2b",
+        pady=0,
+        highlightbackground=borde_color,
+        highlightcolor=borde_color,
+        highlightthickness=2,
+        bd=0,
+    )
+    # Colocar las tarjetas en fila, con espacio horizontal entre ellas
+    wrapper.pack(side="left", padx=8, pady=10)
+    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12)
     card.pack(fill="x")
     _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list)
     return wrapper
@@ -889,9 +915,12 @@ def crear_tarjeta_persona(parent, track_id, info, photo_refs_list):
 
 def actualizar_tarjeta_persona(wrapper, track_id, info, photo_refs_list):
     """Reemplaza el contenido de una tarjeta existente (para mejor match en frame posterior)."""
+    identificado = info.get("identificado", False)
+    borde_color = "#00c040" if identificado else "#0070ff"
+    wrapper.configure(highlightbackground=borde_color, highlightcolor=borde_color)
     for child in list(wrapper.winfo_children()):
         child.destroy()
-    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12, relief="ridge", borderwidth=2)
+    card = tk.Frame(wrapper, bg="#3d3d3d", padx=12, pady=12)
     card.pack(fill="x")
     _llenar_contenido_tarjeta(card, track_id, info, photo_refs_list)
 
@@ -912,68 +941,76 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     # Último frame en que intentamos reconocer por track_id (para espaciar reintentos)
     track_last_recog_frame = {}
     RECOG_RETRY_CADA_FRAMES = 5  # reintentar cada 5 frames (ahorrar CPU, ~6 intentos/seg)
-    # Base de usuarios registrados (cargada en main y pasada en args)
+    REID_THRESHOLD = 0.42  # similitud mínima para re-identificar misma persona con otro track_id
+    # Cache para re-ID: user_id -> (embedding, identidad) cuando el tracker asigna nuevo ID
+    embedding_by_user = {}
+    identity_by_user = {}
     usuarios_registrados = getattr(args, "_usuarios_registrados", [])
     arcface_app = None
+    debug_face = getattr(args, "debug_face", False)
+    pose_model = getattr(args, "_pose_model", None)
 
     root = tk.Tk()
     root.title("Detección ropa — " + path_video.name)
-    root.geometry("1600x800")
+    root.geometry("1600x900")
     root.configure(bg="#2b2b2b")
 
-    # Contenedor principal: 50% vídeo (izq) + 50% panel (der)
+    # Contenedor principal: vídeo arriba, usuarios abajo
     main = tk.Frame(root, bg="#2b2b2b")
     main.pack(fill="both", expand=True, padx=4, pady=4)
+    main.grid_rowconfigure(0, weight=3)  # vídeo
+    main.grid_rowconfigure(1, weight=2)  # tarjetas
     main.grid_columnconfigure(0, weight=1)
-    main.grid_columnconfigure(1, weight=1)
 
-    # ——— Izquierda: vídeo (50%) ———
-    left = tk.Frame(main, bg="#2b2b2b")
-    left.grid(row=0, column=0, sticky="nsew")
-    lbl_frame = tk.Label(left, text="Frame: 0", font=("Segoe UI", 10), fg="white", bg="#2b2b2b")
+    # ——— Parte superior: vídeo ———
+    top = tk.Frame(main, bg="#2b2b2b")
+    top.grid(row=0, column=0, sticky="nsew")
+    lbl_frame = tk.Label(top, text="Frame: 0", font=("Segoe UI", 10), fg="white", bg="#2b2b2b")
     lbl_frame.pack(pady=4)
-    lbl_video = tk.Label(left, bg="#1e1e1e")
+    lbl_video = tk.Label(top, bg="#1e1e1e")
     lbl_video.pack(fill="both", expand=True, padx=4, pady=2)
     photo_ref = [None]
 
-    # ——— Derecha: panel con scroll (50%), tarjetas separadas ———
-    right = tk.Frame(main, bg="#2b2b2b")
-    right.grid(row=0, column=1, sticky="nsew")
-    tk.Label(right, text="Personas detectadas", font=("Segoe UI", 12, "bold"), fg="white", bg="#2b2b2b").pack(pady=(0, 8))
+    # ——— Parte inferior: panel con usuarios ———
+    bottom = tk.Frame(main, bg="#2b2b2b")
+    bottom.grid(row=1, column=0, sticky="nsew")
+    tk.Label(bottom, text="Personas detectadas", font=("Segoe UI", 12, "bold"), fg="white", bg="#2b2b2b").pack(pady=(0, 8))
 
-    # Contenedor scroll: canvas + scrollbar
-    scroll_container = tk.Frame(right, bg="#2b2b2b")
+    # Contenedor scroll: canvas + scrollbar horizontal
+    scroll_container = tk.Frame(bottom, bg="#2b2b2b")
     scroll_container.pack(fill="both", expand=True)
     canvas = tk.Canvas(scroll_container, bg="#2b2b2b", highlightthickness=0)
-    scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
+    scrollbar = tk.Scrollbar(scroll_container, orient="horizontal", command=canvas.xview)
 
     scrollable = tk.Frame(canvas, bg="#2b2b2b")
     scrollable_id = canvas.create_window((0, 0), window=scrollable, anchor="nw")
 
     def _on_frame_configure(event):
+        # Ajustar región desplazable al contenido (en horizontal)
         canvas.configure(scrollregion=canvas.bbox("all"))
 
-    def _on_canvas_configure(event):
-        canvas.itemconfig(scrollable_id, width=event.width)
-
     def _on_mousewheel(event):
+        delta = 0
         if getattr(event, "num", None) == 5:
-            canvas.yview_scroll(1, "units")
+            delta = 1
         elif getattr(event, "num", None) == 4:
-            canvas.yview_scroll(-1, "units")
+            delta = -1
         elif getattr(event, "delta", 0) != 0:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # Ratón típico en Windows/Linux
+            delta = -1 * int(event.delta / 120)
+        if delta != 0:
+            canvas.xview_scroll(delta, "units")
 
     scrollable.bind("<Configure>", _on_frame_configure)
-    canvas.bind("<Configure>", _on_canvas_configure)
     canvas.bind_all("<MouseWheel>", _on_mousewheel)
     canvas.bind_all("<Button-4>", _on_mousewheel)
     canvas.bind_all("<Button-5>", _on_mousewheel)
-    canvas.configure(yscrollcommand=scrollbar.set)
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
+    canvas.configure(xscrollcommand=scrollbar.set)
+    canvas.pack(side="top", fill="both", expand=True)
+    scrollbar.pack(side="bottom", fill="x")
     card_photo_refs = []  # referencias a PhotoImage de las tarjetas
-    card_wrappers = {}  # track_id -> wrapper (para actualizar cuando hay mejor match)
+    card_by_user = {}    # user_id -> wrapper (identificados: una tarjeta por usuario)
+    card_by_track = {}   # track_id -> wrapper (no identificados)
 
     def worker():
         nonlocal arcface_app
@@ -1017,16 +1054,18 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                     es_nuevo = tid not in known_track_ids
                     hubo_mejor_match = False
 
-                    # Reintentar cada RECOG_RETRY_CADA_FRAMES mientras la persona siga visible
-                    debe_intentar = es_nuevo or (frame_idx - last_recog >= RECOG_RETRY_CADA_FRAMES)
+                    # Si ya está identificado: no seguir ejecutando ArcFace
+                    if identidad_actual and identidad_actual.get("nombre"):
+                        debe_intentar = False
+                    else:
+                        debe_intentar = es_nuevo or (frame_idx - last_recog >= RECOG_RETRY_CADA_FRAMES)
                     if debe_intentar:
                         track_last_recog_frame[tid] = frame_idx
                         if arcface_app is None:
                             arcface_app = get_arcface_app()
-                        identidad, has_face, edad_face, genero_face = identificar_cara_arcface(
+                        identidad, has_face, edad_face, genero_face, emb = identificar_cara_arcface(
                             crop_arcface, usuarios_registrados or [], arcface_app,
-                            debug=getattr(args, "debug_face", False),
-                            frame_idx=frame_idx,
+                            debug=debug_face, frame_idx=frame_idx,
                         )
                         if not has_face:
                             if es_nuevo:
@@ -1041,7 +1080,32 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                                     track_identity[tid] = identidad
                                     identidad_actual = identidad
                                     hubo_mejor_match = True
+                                    # Cache para re-ID cuando el tracker asigne otro ID a la misma persona
+                                    uid = identidad.get("id")
+                                    if uid is not None and emb is not None:
+                                        embedding_by_user[uid] = emb.copy()
+                                        identity_by_user[uid] = identidad.copy()
                             else:
+                                # Sin match contra DB: intentar re-ID contra personas ya vistas en sesión
+                                if emb is not None and embedding_by_user and (identidad_actual is None or not identidad_actual.get("nombre")):
+                                    best_uid, best_sim = None, -1.0
+                                    for uid, cached_emb in embedding_by_user.items():
+                                        sim = float(np.dot(emb, cached_emb))
+                                        if sim >= REID_THRESHOLD and sim > best_sim:
+                                            best_sim = sim
+                                            best_uid = uid
+                                    if best_uid is not None:
+                                        cached_id = identity_by_user.get(best_uid)
+                                        if cached_id is not None:
+                                            identidad = cached_id.copy()
+                                            identidad["edad"] = edad_face
+                                            identidad["genero"] = genero_face
+                                            identidad["score"] = best_sim
+                                            track_identity[tid] = identidad
+                                            identidad_actual = identidad
+                                            hubo_mejor_match = True
+                                            embedding_by_user[best_uid] = emb.copy()
+                                            identity_by_user[best_uid] = identidad.copy()
                                 if identidad_actual is None or not identidad_actual.get("nombre"):
                                     track_identity[tid] = {"edad": edad_face, "genero": genero_face}
                                     identidad_actual = track_identity[tid]
@@ -1051,7 +1115,6 @@ def run_visor_tkinter(cap, model, fps, writer, args):
 
                     identidad = track_identity.get(tid)
                     comp_list = comp_por_persona[i] if i < len(comp_por_persona) else []
-                    pose_model = getattr(args, "_pose_model", None)
                     info = extract_person_info(
                         frame, xyxy, comp_list, h_frame, w_frame, pose_model=pose_model
                     )
@@ -1111,14 +1174,31 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                 msg = person_queue.get_nowait()
                 if msg[0] == "new":
                     _, track_id, info = msg
-                    wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
-                    card_wrappers[track_id] = wrapper
+                    user_id = info.get("user_id") if info.get("identificado") else None
+                    if user_id is not None and user_id in card_by_user:
+                        # Mismo usuario ya mostrado (otro track_id): actualizar tarjeta existente, no crear duplicado
+                        actualizar_tarjeta_persona(card_by_user[user_id], track_id, info, card_photo_refs)
+                    elif user_id is not None:
+                        wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
+                        card_by_user[user_id] = wrapper
+                    else:
+                        wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
+                        card_by_track[track_id] = wrapper
                     canvas.configure(scrollregion=canvas.bbox("all"))
                 elif msg[0] == "update":
                     _, track_id, info = msg
-                    if track_id in card_wrappers:
-                        actualizar_tarjeta_persona(card_wrappers[track_id], track_id, info, card_photo_refs)
-                        canvas.configure(scrollregion=canvas.bbox("all"))
+                    user_id = info.get("user_id") if info.get("identificado") else None
+                    if user_id is not None and user_id in card_by_user:
+                        actualizar_tarjeta_persona(card_by_user[user_id], track_id, info, card_photo_refs)
+                        if track_id in card_by_track:
+                            card_by_track[track_id].destroy()
+                            del card_by_track[track_id]
+                    elif user_id is not None and track_id in card_by_track:
+                        actualizar_tarjeta_persona(card_by_track[track_id], track_id, info, card_photo_refs)
+                        card_by_user[user_id] = card_by_track.pop(track_id)
+                    elif track_id in card_by_track:
+                        actualizar_tarjeta_persona(card_by_track[track_id], track_id, info, card_photo_refs)
+                    canvas.configure(scrollregion=canvas.bbox("all"))
         except Empty:
             pass
         root.after(40, poll_queue)
@@ -1152,8 +1232,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="yolov8n.pt",
-        help="Modelo YOLO (default: yolov8n.pt)",
+        default=YOLO_MODEL,
+        help=f"Modelo YOLO (default: {YOLO_MODEL})",
     )
     parser.add_argument(
         "--mostrar",
@@ -1194,8 +1274,8 @@ def main():
     parser.add_argument(
         "--pose-model",
         type=str,
-        default="yolov8n-pose.pt",
-        help="Modelo YOLO-pose para segmentar torso/inferior (default: yolov8n-pose.pt)",
+        default=YOLO_MODEL_POSE,
+        help=f"Modelo YOLO-pose para segmentar torso/inferior (default: {YOLO_MODEL_POSE})",
     )
     parser.add_argument(
         "--no-pose",
@@ -1218,12 +1298,20 @@ def main():
         print(f"Error: no existe el fichero '{args.video}'", file=sys.stderr)
         sys.exit(1)
 
-    print("Cargando modelo YOLO...")
+    print(f"Cargando modelo YOLO en dispositivo '{DEVICE}'...")
     model = YOLO(args.model)
+    try:
+        model.to(DEVICE)
+    except Exception:
+        pass
     args._pose_model = None
     if args.mostrar and not args.no_pose:
-        print("Cargando modelo YOLO-pose para segmentación de torso/color...")
+        print(f"Cargando modelo YOLO-pose para segmentación de torso/color en dispositivo '{DEVICE}'...")
         args._pose_model = YOLO(args.pose_model)
+        try:
+            args._pose_model.to(DEVICE)
+        except Exception:
+            pass
     # Base de usuarios registrados (para identificación con ArcFace)
     args._usuarios_registrados = load_registered_users()
     cap = cv2.VideoCapture(str(path_video))
