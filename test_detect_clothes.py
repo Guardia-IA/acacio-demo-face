@@ -37,6 +37,13 @@ except Exception:
     HAS_CUDA = False
     DEVICE = "cpu"
 
+try:
+    import importlib
+
+    _HAS_DEEPSTREAM = importlib.util.find_spec("pyds") is not None
+except Exception:
+    _HAS_DEEPSTREAM = False
+
 PATH_VIDEOS = "/home/debian/sharedVM/sergi_reconocimiento_facial/finalesv2"
 # Modelos YOLO por defecto (puedes cambiarlos fácil para probar otros)
 YOLO_MODEL = "yolo11x.pt"
@@ -76,6 +83,38 @@ def get_arcface_app():
             app.prepare(ctx_id=-1, det_thresh=0.4, det_size=(640, 640))
         _arcface_app = app
     return _arcface_app
+
+
+def open_video_capture(path_video: Path, use_gstreamer: bool = False) -> cv2.VideoCapture:
+    """
+    Abre un VideoCapture. Si use_gstreamer es True e OpenCV fue compilado con GStreamer,
+    intenta usar un pipeline GStreamer con decodificación por hardware (útil en Jetson).
+    Si falla, vuelve a cv2.VideoCapture normal.
+    """
+    path_str = str(path_video)
+    if use_gstreamer:
+        try:
+            build_info = cv2.getBuildInformation()
+            if "GStreamer" in build_info:
+                # Pipeline genérico para ficheros MP4/H264; puede requerir ajustes según el códec real.
+                gst_pipeline = (
+                    f"filesrc location={path_str} ! "
+                    f"qtdemux ! h264parse ! nvv4l2decoder ! "
+                    f"nvvidconv ! video/x-raw,format=BGRx ! "
+                    f"videoconvert ! video/x-raw,format=BGR ! "
+                    f"appsink drop=true sync=false"
+                )
+                cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                if cap.isOpened():
+                    print("[video] Usando GStreamer (posible HW decode / DeepStream) para leer el vídeo.")
+                    return cap
+                else:
+                    cap.release()
+        except Exception:
+            pass
+    # Fallback estándar
+    cap = cv2.VideoCapture(path_str)
+    return cap
 
 
 def load_registered_users():
@@ -1438,6 +1477,11 @@ def main():
         action="store_true",
         help="Imprimir scores de similitud al intentar identificar caras (diagnóstico)",
     )
+    parser.add_argument(
+        "--gst",
+        action="store_true",
+        help="Intentar abrir el vídeo con GStreamer/HW decode (útil en Jetson; requiere OpenCV con GStreamer).",
+    )
     args = parser.parse_args()
 
     # Si el argumento es una ruta absoluta, usarla tal cual; si no, concatenar con PATH_VIDEOS
@@ -1482,7 +1526,7 @@ def main():
                 pass
     # Base de usuarios registrados (para identificación con ArcFace)
     args._usuarios_registrados = load_registered_users()
-    cap = cv2.VideoCapture(str(path_video))
+    cap = open_video_capture(path_video, use_gstreamer=args.gst)
     if not cap.isOpened():
         print(f"Error: no se pudo abrir el vídeo '{args.video}'", file=sys.stderr)
         sys.exit(1)
