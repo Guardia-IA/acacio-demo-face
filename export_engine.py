@@ -12,6 +12,7 @@ Ambas usan la API oficial de Ultralytics:
 
 from pathlib import Path
 from typing import Union
+import argparse
 import shutil
 
 from ultralytics import YOLO
@@ -114,5 +115,79 @@ def export_yolo_pose_engine(
     return final_path
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Exportar modelos YOLO a TensorRT (.engine). "
+            "Modo: 'yolo', 'pose' o 'all'. Los .engine se guardan en ./engines"
+        )
+    )
+    parser.add_argument(
+        "mode",
+        choices=["yolo", "pose", "all"],
+        help="Qué exportar: solo detección (yolo), solo pose (pose) o ambos (all).",
+    )
+    parser.add_argument(
+        "--yolo-weights",
+        type=str,
+        default="yolo11x.pt",
+        help="Pesos YOLO de detección (default: yolo11x.pt).",
+    )
+    parser.add_argument(
+        "--pose-weights",
+        type=str,
+        default="yolo11x-pose.pt",
+        help="Pesos YOLO pose (default: yolo11x-pose.pt).",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="Tamaño de entrada (lado) para exportar el engine (default: 640).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Dispositivo para la exportación: cuda, cuda:0, cpu... (default: cuda).",
+    )
+    parser.add_argument(
+        "--no-half",
+        action="store_true",
+        help="Usar FP32 en vez de FP16 (half=False).",
+    )
+    parser.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="Habilitar batch dinámico en el engine.",
+    )
+
+    args = parser.parse_args()
+    half = not args.no_half
+
+    if args.mode in ("yolo", "all"):
+        det_path = export_yolo_engine(
+            args.yolo_weights,
+            imgsz=args.imgsz,
+            device=args.device,
+            half=half,
+            dynamic=args.dynamic,
+        )
+        print(f"[export_engine] Engine YOLO detección generado en: {det_path}")
+
+    if args.mode in ("pose", "all"):
+        pose_path = export_yolo_pose_engine(
+            args.pose_weights,
+            imgsz=args.imgsz,
+            device=args.device,
+            half=half,
+            dynamic=args.dynamic,
+        )
+        print(f"[export_engine] Engine YOLO pose generado en: {pose_path}")
+
+
 __all__ = ["export_yolo_engine", "export_yolo_pose_engine"]
+
+if __name__ == "__main__":
+    main()
 
