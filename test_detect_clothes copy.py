@@ -294,18 +294,17 @@ COLOR_NAMES_HSV = [
     # Rojo (incl. rojo oscuro/burdeos): H 0-10 o 170-180, S algo alta, V bajo permitido
     (0, 10, 40, 35, "rojo"),
     (170, 180, 40, 35, "rojo"),
-    (10, 25, 80, 70, "naranja"),
-    (25, 35, 80, 70, "amarillo"),
-    # Relajamos S/V para ropa real (menos saturada que colores "puros")
-    (35, 85, 60, 50, "verde"),
-    (85, 100, 60, 50, "verde lima"),
-    (100, 130, 50, 50, "azul"),
-    (130, 160, 50, 50, "violeta"),
-    (160, 170, 50, 50, "magenta"),
-    (0, 10, 40, 180, "rosa"),
-    (10, 25, 50, 170, "rosa/naranja"),
-    (0, 30, 25, 90, "marrón"),
-    (20, 40, 25, 190, "beige"),
+    (10, 25, 100, 80, "naranja"),
+    (25, 35, 100, 80, "amarillo"),
+    (35, 85, 80, 80, "verde"),
+    (85, 100, 80, 80, "verde lima"),
+    (100, 130, 80, 80, "azul"),
+    (130, 160, 80, 80, "violeta"),
+    (160, 170, 80, 80, "magenta"),
+    (0, 10, 50, 200, "rosa"),
+    (10, 25, 80, 180, "rosa/naranja"),
+    (0, 30, 30, 100, "marrón"),
+    (20, 40, 30, 200, "beige"),
     # Grises después de los colores con tono
     (0, 180, 0, 50, "gris oscuro"),
     (0, 180, 1, 50, "gris"),
@@ -380,21 +379,11 @@ def color_dominante_region(imagen_bgr, max_muestras=2000, paso_cuantizacion=32, 
     """
     if imagen_bgr is None or imagen_bgr.size == 0:
         return {"hex": "#505050", "nombre": "no detectable"}
-    # Reordenar a lista de píxeles
     pixels = imagen_bgr.reshape(-1, 3)
     n = len(pixels)
     if n > max_muestras:
         idx = np.random.choice(n, max_muestras, replace=False)
         pixels = pixels[idx]
-        n = len(pixels)
-    # Filtro para evitar que el fondo gris/blanco domine el color de la ropa:
-    # nos quedamos preferentemente con píxeles más saturados y suficientemente iluminados.
-    hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    s = hsv[:, 1]
-    v = hsv[:, 2]
-    mask_color = (s >= 40) & (v >= 40)
-    if np.any(mask_color):
-        pixels = pixels[mask_color]
         n = len(pixels)
     paso = paso_cuantizacion
     bins_r = (pixels[:, 2] // paso).astype(np.int32)
@@ -954,12 +943,10 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     # Último frame en que intentamos reconocer por track_id (para espaciar reintentos)
     track_last_recog_frame = {}
     RECOG_RETRY_CADA_FRAMES = 5  # reintentar cada 5 frames (ahorrar CPU, ~6 intentos/seg)
-    REID_THRESHOLD = 0.6  # similitud mínima para re-identificar misma persona (clustering general por embedding)
-    # Re-ID general por persona física (registrada o no)
-    next_person_id = 1
-    track_to_person = {}   # track_id -> person_id global
-    person_embedding = {}  # person_id -> embedding medio
-    person_meta = {}       # person_id -> metadatos (edad, genero, user_id si identificado)
+    REID_THRESHOLD = 0.42  # similitud mínima para re-identificar misma persona con otro track_id
+    # Cache para re-ID: user_id -> (embedding, identidad) cuando el tracker asigna nuevo ID
+    embedding_by_user = {}
+    identity_by_user = {}
     usuarios_registrados = getattr(args, "_usuarios_registrados", [])
     arcface_app = None
     debug_face = getattr(args, "debug_face", False)
@@ -987,33 +974,13 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     main.grid_rowconfigure(1, weight=2)  # tarjetas
     main.grid_columnconfigure(0, weight=1)
 
-    # ——— Parte superior: vídeo + barra de estado/botón cerrar ———
+    # ——— Parte superior: vídeo ———
     top = tk.Frame(main, bg="#2b2b2b")
     top.grid(row=0, column=0, sticky="nsew")
-
-    top_bar = tk.Frame(top, bg="#2b2b2b")
-    top_bar.pack(fill="x", pady=(4, 2), padx=4)
-
-    lbl_frame = tk.Label(top_bar, text="Frame: 0", font=("Segoe UI", 10), fg="white", bg="#2b2b2b")
-    lbl_frame.pack(side="left")
-
-    btn_cerrar = tk.Button(
-        top_bar,
-        text="Cerrar",
-        command=lambda: on_cerrar(),
-        font=("Segoe UI", 9),
-        cursor="hand2",
-        bg="#444",
-        fg="white",
-        relief="raised",
-        bd=1,
-        padx=8,
-        pady=2,
-    )
-    btn_cerrar.pack(side="right")
-
+    lbl_frame = tk.Label(top, text="Frame: 0", font=("Segoe UI", 10), fg="white", bg="#2b2b2b")
+    lbl_frame.pack(pady=4)
     lbl_video = tk.Label(top, bg="#1e1e1e")
-    lbl_video.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+    lbl_video.pack(fill="both", expand=True, padx=4, pady=2)
     photo_ref = [None]
 
     # ——— Parte inferior: panel con usuarios ———
@@ -1054,12 +1021,11 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     canvas.pack(side="top", fill="both", expand=True)
     scrollbar.pack(side="bottom", fill="x")
     card_photo_refs = []  # referencias a PhotoImage de las tarjetas
-    card_by_user = {}     # user_id -> wrapper (identificados: una tarjeta por usuario)
-    card_by_track = {}    # track_id -> wrapper (no identificados sin clustering aún)
-    card_by_person = {}   # person_id global -> wrapper (desconocidos re-identificados)
+    card_by_user = {}    # user_id -> wrapper (identificados: una tarjeta por usuario)
+    card_by_track = {}   # track_id -> wrapper (no identificados)
 
     def worker():
-        nonlocal arcface_app, next_person_id, track_to_person, person_embedding, person_meta
+        nonlocal arcface_app
         frame_idx = 0
         last_boxes_with_id = []
         last_dog_boxes = []
@@ -1091,50 +1057,21 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                     if tid is None:
                         continue
 
-                    # Crop de persona completo
-                    x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w_frame, x2), min(h_frame, y2)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    crop_person = frame[y1:y2, x1:x2]
-
-                    # Comprobar pose humana (tronco/piernas) si hay modelo de pose
-                    pose_ok = False
-                    if pose_model is not None and crop_person is not None and crop_person.size > 0:
-                        zona_torso_tmp, zona_piernas_tmp = get_torso_y_piernas_from_pose(crop_person, pose_model)
-                        min_area = 40 * 40  # área mínima para considerar torso/piernas válidos
-                        area_torso = zona_torso_tmp.size if zona_torso_tmp is not None else 0
-                        area_piernas = zona_piernas_tmp.size if zona_piernas_tmp is not None else 0
-                        if (zona_torso_tmp is not None and area_torso >= min_area) or (
-                            zona_piernas_tmp is not None and area_piernas >= min_area
-                        ):
-                            pose_ok = True
-
-                    # Relación de aspecto de la bbox (alto/ancho)
-                    h_box = y2 - y1
-                    w_box = x2 - x1
-                    ar = h_box / float(w_box) if w_box > 0 else 0.0
-
                     crop_arcface = get_face_crop_for_arcface(frame, xyxy, h_frame, w_frame)
+                    if crop_arcface is None:
+                        continue
 
                     identidad_actual = track_identity.get(tid)
                     last_recog = track_last_recog_frame.get(tid, -999)
                     es_nuevo = tid not in known_track_ids
                     hubo_mejor_match = False
 
-                    identidad = None
-                    has_face = False
-                    edad_face = None
-                    genero_face = None
-                    emb = None
-
                     # Si ya está identificado: no seguir ejecutando ArcFace
                     if identidad_actual and identidad_actual.get("nombre"):
                         debe_intentar = False
                     else:
                         debe_intentar = es_nuevo or (frame_idx - last_recog >= RECOG_RETRY_CADA_FRAMES)
-                    if debe_intentar and crop_arcface is not None:
+                    if debe_intentar:
                         track_last_recog_frame[tid] = frame_idx
                         if arcface_app is None:
                             arcface_app = get_arcface_app()
@@ -1143,14 +1080,9 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                             debug=debug_face, frame_idx=frame_idx,
                         )
                         if not has_face:
-                            # Sin cara clara: solo aceptamos si la pose parece humana y la bbox tiene proporciones humanas
-                            humano = pose_ok and (1.0 <= ar <= 5.0)
-                            if not humano and es_nuevo:
-                                # Sin cara, sin pose humana clara → ignorar (ej. perro mal clasificado)
-                                continue
-                        if has_face or pose_ok:
                             if es_nuevo:
-                                known_track_ids.add(tid)
+                                continue
+                        else:
                             if identidad is not None:
                                 score_nuevo = identidad.get("score", 0)
                                 identidad["edad"] = edad_face
@@ -1160,57 +1092,35 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                                     track_identity[tid] = identidad
                                     identidad_actual = identidad
                                     hubo_mejor_match = True
+                                    # Cache para re-ID cuando el tracker asigne otro ID a la misma persona
+                                    uid = identidad.get("id")
+                                    if uid is not None and emb is not None:
+                                        embedding_by_user[uid] = emb.copy()
+                                        identity_by_user[uid] = identidad.copy()
                             else:
+                                # Sin match contra DB: intentar re-ID contra personas ya vistas en sesión
+                                if emb is not None and embedding_by_user and (identidad_actual is None or not identidad_actual.get("nombre")):
+                                    best_uid, best_sim = None, -1.0
+                                    for uid, cached_emb in embedding_by_user.items():
+                                        sim = float(np.dot(emb, cached_emb))
+                                        if sim >= REID_THRESHOLD and sim > best_sim:
+                                            best_sim = sim
+                                            best_uid = uid
+                                    if best_uid is not None:
+                                        cached_id = identity_by_user.get(best_uid)
+                                        if cached_id is not None:
+                                            identidad = cached_id.copy()
+                                            identidad["edad"] = edad_face
+                                            identidad["genero"] = genero_face
+                                            identidad["score"] = best_sim
+                                            track_identity[tid] = identidad
+                                            identidad_actual = identidad
+                                            hubo_mejor_match = True
+                                            embedding_by_user[best_uid] = emb.copy()
+                                            identity_by_user[best_uid] = identidad.copy()
                                 if identidad_actual is None or not identidad_actual.get("nombre"):
                                     track_identity[tid] = {"edad": edad_face, "genero": genero_face}
                                     identidad_actual = track_identity[tid]
-
-                        # Asignar / actualizar person_id global usando embedding (re-ID general)
-                        if emb is not None:
-                            pid_actual = track_to_person.get(tid)
-                            if pid_actual is not None and pid_actual in person_embedding:
-                                # Actualizar embedding medio del cluster (media exponencial)
-                                e_old = person_embedding[pid_actual]
-                                alpha = 0.8
-                                e_new = alpha * e_old + (1.0 - alpha) * emb
-                                nrm = np.linalg.norm(e_new)
-                                if nrm > 1e-6:
-                                    e_new = e_new / nrm
-                                person_embedding[pid_actual] = e_new
-                                pid = pid_actual
-                            else:
-                                # Buscar el cluster más parecido
-                                best_pid, best_sim = None, -1.0
-                                for pid_existente, e in person_embedding.items():
-                                    sim = float(np.dot(emb, e))
-                                    if sim > best_sim:
-                                        best_sim = sim
-                                        best_pid = pid_existente
-                                if best_pid is not None and best_sim >= REID_THRESHOLD:
-                                    pid = best_pid
-                                    e_old = person_embedding[pid]
-                                    alpha = 0.8
-                                    e_new = alpha * e_old + (1.0 - alpha) * emb
-                                    nrm = np.linalg.norm(e_new)
-                                    if nrm > 1e-6:
-                                        e_new = e_new / nrm
-                                    person_embedding[pid] = e_new
-                                else:
-                                    pid = next_person_id
-                                    next_person_id += 1
-                                    person_embedding[pid] = emb.copy()
-                                track_to_person[tid] = pid
-
-                            # Actualizar metadatos de la persona global
-                            meta = person_meta.get(pid, {})
-                            if identidad is not None and identidad.get("nombre"):
-                                meta["user_id"] = identidad.get("id")
-                                meta["user_nombre"] = identidad.get("nombre")
-                            if edad_face is not None:
-                                meta["edad"] = edad_face
-                            if genero_face is not None:
-                                meta["genero"] = genero_face
-                            person_meta[pid] = meta
 
                     if es_nuevo:
                         known_track_ids.add(tid)
@@ -1234,11 +1144,6 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                         info["user_nombre"] = "desconocido"
                         info["edad"] = identidad.get("edad") if identidad else None
                         info["genero"] = identidad.get("genero") if identidad else None
-
-                    # Adjuntar person_id global (si existe) para re-ID en tarjetas
-                    pid_info = track_to_person.get(tid)
-                    if pid_info is not None:
-                        info["person_id"] = pid_info
                     info["crop_cara"] = crop_arcface.copy()
 
                     try:
@@ -1286,32 +1191,12 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                 if msg[0] == "new":
                     _, track_id, info = msg
                     user_id = info.get("user_id") if info.get("identificado") else None
-                    pid = info.get("person_id")
-                    # Limpieza extra: si este user_id ya estaba asociado a alguna persona global,
-                    # eliminar cualquier tarjeta residual por person_id para no duplicar usuarios.
-                    if user_id is not None:
-                        for pid_existing, wrapper in list(card_by_person.items()):
-                            meta = person_meta.get(pid_existing, {})
-                            if meta.get("user_id") == user_id:
-                                wrapper.destroy()
-                                del card_by_person[pid_existing]
                     if user_id is not None and user_id in card_by_user:
                         # Mismo usuario ya mostrado (otro track_id): actualizar tarjeta existente, no crear duplicado
                         actualizar_tarjeta_persona(card_by_user[user_id], track_id, info, card_photo_refs)
                     elif user_id is not None:
                         wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
                         card_by_user[user_id] = wrapper
-                        # Si existía tarjeta por person_id, eliminarla
-                        if pid is not None and pid in card_by_person:
-                            card_by_person[pid].destroy()
-                            del card_by_person[pid]
-                    elif pid is not None:
-                        # Desconocido, pero con person_id global (clustering)
-                        if pid in card_by_person:
-                            actualizar_tarjeta_persona(card_by_person[pid], track_id, info, card_photo_refs)
-                        else:
-                            wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
-                            card_by_person[pid] = wrapper
                     else:
                         wrapper = crear_tarjeta_persona(scrollable, track_id, info, card_photo_refs)
                         card_by_track[track_id] = wrapper
@@ -1319,36 +1204,14 @@ def run_visor_tkinter(cap, model, fps, writer, args):
                 elif msg[0] == "update":
                     _, track_id, info = msg
                     user_id = info.get("user_id") if info.get("identificado") else None
-                    pid = info.get("person_id")
-                    if user_id is not None:
-                        for pid_existing, wrapper in list(card_by_person.items()):
-                            meta = person_meta.get(pid_existing, {})
-                            if meta.get("user_id") == user_id:
-                                wrapper.destroy()
-                                del card_by_person[pid_existing]
                     if user_id is not None and user_id in card_by_user:
                         actualizar_tarjeta_persona(card_by_user[user_id], track_id, info, card_photo_refs)
                         if track_id in card_by_track:
                             card_by_track[track_id].destroy()
                             del card_by_track[track_id]
-                        if pid is not None and pid in card_by_person:
-                            card_by_person[pid].destroy()
-                            del card_by_person[pid]
                     elif user_id is not None and track_id in card_by_track:
                         actualizar_tarjeta_persona(card_by_track[track_id], track_id, info, card_photo_refs)
                         card_by_user[user_id] = card_by_track.pop(track_id)
-                        if pid is not None and pid in card_by_person:
-                            card_by_person[pid].destroy()
-                            del card_by_person[pid]
-                    elif pid is not None and pid in card_by_person:
-                        actualizar_tarjeta_persona(card_by_person[pid], track_id, info, card_photo_refs)
-                        if track_id in card_by_track:
-                            card_by_track[track_id].destroy()
-                            del card_by_track[track_id]
-                    elif pid is not None and track_id in card_by_track:
-                        # Promocionar tarjeta por track_id a tarjeta por person_id
-                        actualizar_tarjeta_persona(card_by_track[track_id], track_id, info, card_photo_refs)
-                        card_by_person[pid] = card_by_track.pop(track_id)
                     elif track_id in card_by_track:
                         actualizar_tarjeta_persona(card_by_track[track_id], track_id, info, card_photo_refs)
                     canvas.configure(scrollregion=canvas.bbox("all"))
@@ -1359,9 +1222,11 @@ def run_visor_tkinter(cap, model, fps, writer, args):
     def on_cerrar():
         playing[0] = False
         cap.release()  # El worker recibirá ret=False y saldrá limpio del loop
+        th.join(timeout=2.0)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_cerrar)
+    tk.Button(root, text="Cerrar", command=on_cerrar, font=("Segoe UI", 10), cursor="hand2").pack(pady=6)
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()
