@@ -52,6 +52,12 @@ def get_face_app():
         except Exception:
             # Si falla en GPU, reintentar en CPU
             _app_insightface.prepare(ctx_id=-1, det_thresh=0.4, det_size=(512, 512))
+        # Mensaje de diagnóstico sobre el dispositivo usado
+        try:
+            ctx_info = getattr(_app_insightface, "ctx_id", INSIGHTFACE_CTX_ID)
+        except Exception:
+            ctx_info = INSIGHTFACE_CTX_ID
+        print(f"[face_tracking] InsightFace inicializado con ctx_id={ctx_info} (HAS_CUDA={HAS_CUDA})")
     return _app_insightface
 
 # Mínimo por pose para considerar "mínima calidad"; seguimos capturando hasta el máximo
@@ -170,7 +176,7 @@ def clasificar_pose(face):
     return "frontal"
 
 
-def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
+def run_face_tracking(path_video: Path, id_persona: int, nombre: str, lite: bool = False) -> bool:
     """
     Abre el vídeo, muestra ventana Tkinter con cara (bbox + puntos) y barra de progreso,
     recoge embeddings ArcFace (512-d) hasta tener NUM_FRAMES_META, y guarda en face_tracking/<id>_<nombre>.pkl.
@@ -329,6 +335,16 @@ def run_face_tracking(path_video: Path, id_persona: int, nombre: str) -> bool:
                 except Exception:
                     pass
                 break
+
+            # Modo lite: reescalar el frame para trabajar como máximo a ~1080p
+            if lite and frame is not None and frame.size > 0:
+                h_src, w_src = frame.shape[:2]
+                max_h, max_w = 1080, 1920
+                if h_src > max_h or w_src > max_w:
+                    escala = min(max_w / float(w_src), max_h / float(h_src))
+                    nw, nh = int(w_src * escala), int(h_src * escala)
+                    if nw > 0 and nh > 0:
+                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
             frame_dibujo = frame.copy()
 
@@ -492,9 +508,14 @@ def main():
     parser.add_argument("video", type=str, help="Ruta al fichero de vídeo")
     parser.add_argument("--id", dest="id_persona", type=int, required=True, help="ID numérico de la persona")
     parser.add_argument("--nombre", type=str, required=True, help="Nombre de la persona (para el fichero de salida)")
+    parser.add_argument(
+        "--lite",
+        action="store_true",
+        help="Modo lite: procesar el vídeo reescalado a máx. 1080p en vez de resolución completa (4K, etc.)",
+    )
     args = parser.parse_args()
 
-    ok = run_face_tracking(Path(args.video), args.id_persona, args.nombre)
+    ok = run_face_tracking(Path(args.video), args.id_persona, args.nombre, lite=args.lite)
     sys.exit(0 if ok else 1)
 
 
