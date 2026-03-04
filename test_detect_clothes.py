@@ -41,6 +41,8 @@ PATH_VIDEOS = "/home/debian/sharedVM/sergi_reconocimiento_facial/finalesv2"
 # Modelos YOLO por defecto (puedes cambiarlos fácil para probar otros)
 YOLO_MODEL = "yolo11x.pt"
 YOLO_MODEL_POSE = "yolo11x-pose.pt"
+BASE_DIR = Path(__file__).resolve().parent
+ENGINES_DIR = BASE_DIR / "engines"
 
 # Suprimir FutureWarning de InsightFace (skimage: tform.estimate deprecado)
 warnings.filterwarnings("ignore", message=".*estimate.*deprecated.*", category=FutureWarning)
@@ -1298,20 +1300,37 @@ def main():
         print(f"Error: no existe el fichero '{args.video}'", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Cargando modelo YOLO en dispositivo '{DEVICE}'...")
-    model = YOLO(args.model)
-    try:
-        model.to(DEVICE)
-    except Exception:
-        pass
-    args._pose_model = None
-    if args.mostrar and not args.no_pose:
-        print(f"Cargando modelo YOLO-pose para segmentación de torso/color en dispositivo '{DEVICE}'...")
-        args._pose_model = YOLO(args.pose_model)
+    # --- Carga del modelo principal YOLO: primero intentamos engine, luego .pt (GPU/CPU) ---
+    ENGINES_DIR.mkdir(parents=True, exist_ok=True)
+    model_stem = Path(args.model).stem
+    engine_path = ENGINES_DIR / f"{model_stem}.engine"
+
+    if engine_path.exists():
+        print(f"Cargando modelo YOLO desde engine: '{engine_path}'")
+        model = YOLO(str(engine_path))
+    else:
+        print(f"Cargando modelo YOLO desde pesos '{args.model}' en dispositivo '{DEVICE}'...")
+        model = YOLO(args.model)
         try:
-            args._pose_model.to(DEVICE)
+            model.to(DEVICE)
         except Exception:
             pass
+
+    # --- Carga del modelo de pose (si procede): engine > .pt (GPU/CPU) ---
+    args._pose_model = None
+    if args.mostrar and not args.no_pose:
+        pose_stem = Path(args.pose_model).stem
+        pose_engine_path = ENGINES_DIR / f"{pose_stem}.engine"
+        if pose_engine_path.exists():
+            print(f"Cargando modelo YOLO-pose desde engine: '{pose_engine_path}'")
+            args._pose_model = YOLO(str(pose_engine_path))
+        else:
+            print(f"Cargando modelo YOLO-pose desde pesos '{args.pose_model}' en dispositivo '{DEVICE}'...")
+            args._pose_model = YOLO(args.pose_model)
+            try:
+                args._pose_model.to(DEVICE)
+            except Exception:
+                pass
     # Base de usuarios registrados (para identificación con ArcFace)
     args._usuarios_registrados = load_registered_users()
     cap = cv2.VideoCapture(str(path_video))
